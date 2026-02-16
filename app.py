@@ -574,45 +574,114 @@ def get_sentiment(symbol):
     """Analyze stock sentiment using Grok API"""
     
     if not GROK_API_KEY:
-        return jsonify({"error": "Sentiment analysis not configured"}), 500
+        log.warning("[SENTIMENT] GROK_API_KEY not configured - returning mock data")
+        # Return mock sentiment data for demo purposes
+        return jsonify({
+            "overall": "Neutral",
+            "overallScore": 6,
+            "summary": f"Sentiment analysis for {symbol.upper()} is currently in demo mode. Configure GROK_API_KEY environment variable to enable live AI-powered analysis.",
+            "categories": [
+                {
+                    "name": "Social Media",
+                    "sentiment": "Neutral",
+                    "score": 6,
+                    "points": ["Demo mode active", "Configure Grok API key for live analysis"]
+                },
+                {
+                    "name": "News Sentiment",
+                    "sentiment": "Neutral",
+                    "score": 6,
+                    "points": ["Demo mode active", "Real-time news analysis available with API key"]
+                },
+                {
+                    "name": "Analyst Sentiment",
+                    "sentiment": "Neutral",
+                    "score": 6,
+                    "points": ["Demo mode active", "Analyst views available with API key"]
+                }
+            ],
+            "recentTriggers": ["Demo mode - Add GROK_API_KEY to enable live analysis"],
+            "recommendation": "This is demo sentiment data. Get your Grok API key from https://x.ai/api and add it to your environment variables as GROK_API_KEY to enable real AI-powered sentiment analysis."
+        })
     
     sym = symbol.upper()
     
     # Build prompt for Grok
-    prompt = f"""Analyze the current market sentiment for {sym} (Indian stock).
+    prompt = f"""You are a financial analyst. Today's date is February 16, 2026.
 
-Provide a comprehensive sentiment analysis covering:
-1. Social Media Sentiment (Twitter, Reddit, forums) - Positive/Neutral/Negative
-2. News Sentiment (recent news articles) - Positive/Neutral/Negative  
-3. Analyst Sentiment (broker reports, analyst views) - Positive/Neutral/Negative
-4. Company Growth Prospects - Strong/Moderate/Weak
-5. Earnings Forecast Sentiment - Bullish/Neutral/Bearish
-6. Sector Sentiment (sector the company operates in) - Positive/Neutral/Negative
+IMPORTANT: Use your web search capabilities to find the LATEST, MOST RECENT information about {sym} (Indian stock listed on NSE/BSE).
 
-For each category, provide:
-- Overall sentiment score (Positive/Neutral/Negative or similar)
-- 2-3 key points explaining the sentiment
-- Any recent triggers or events
+Search and analyze:
+1. Latest news articles from past 7 days (Economic Times, Moneycontrol, Business Standard, Mint)
+2. Recent Twitter/X posts and discussions about {sym}
+3. Latest broker reports and analyst recommendations
+4. Recent company announcements and quarterly results
+5. Current sector trends and developments
+6. Reddit discussions on Indian stock forums
 
-Format response as JSON with this structure:
+For {sym}, provide a comprehensive sentiment analysis with CURRENT, UP-TO-DATE data covering:
+
+1. Social Media Sentiment (Twitter/X, Reddit, forums)
+   - What are people saying RIGHT NOW?
+   - Recent discussions and trends
+   - Retail investor sentiment
+
+2. News Sentiment (last 7 days)
+   - Latest news articles and coverage
+   - Recent company announcements
+   - Media tone and framing
+
+3. Analyst Sentiment (recent reports)
+   - Latest broker recommendations
+   - Recent upgrades/downgrades
+   - Current price target changes
+
+4. Company Growth Prospects
+   - Latest business developments
+   - Recent expansion/acquisition news
+   - Current strategic initiatives
+
+5. Earnings Forecast
+   - Latest quarterly results
+   - Recent guidance updates
+   - Current consensus estimates
+
+6. Sector Sentiment
+   - Current sector trends
+   - Recent regulatory changes
+   - Industry developments
+
+For each category:
+- Provide current sentiment (Positive/Neutral/Negative)
+- Give score 1-10
+- List 2-3 SPECIFIC, RECENT points with dates/sources when possible
+- Include recent events or triggers from past 2-4 weeks
+
+CRITICAL: Only use information from the past 30 days. Do NOT use outdated information. If you cannot find recent data, clearly state "Limited recent data available" for that category.
+
+Format response as JSON:
 {{
   "overall": "Positive/Neutral/Negative",
   "overallScore": 7,
-  "summary": "Brief 2-3 sentence overall summary",
+  "summary": "2-3 sentence summary with latest developments",
   "categories": [
     {{
       "name": "Social Media",
-      "sentiment": "Positive",
+      "sentiment": "Positive/Neutral/Negative",
       "score": 8,
-      "points": ["Point 1", "Point 2"]
-    }},
-    ...
+      "points": ["Specific recent point with date/context", "Another recent point"]
+    }}
   ],
-  "recentTriggers": ["Event 1", "Event 2"],
-  "recommendation": "Brief recommendation"
+  "recentTriggers": ["Event 1 with date", "Event 2 with date"],
+  "recommendation": "Recommendation based on latest data",
+  "dataFreshness": "Mention most recent data sources and dates used"
 }}"""
 
     try:
+        log.info(f"[SENTIMENT] Starting analysis for {sym}")
+        log.info(f"[SENTIMENT] API Key present: {bool(GROK_API_KEY)}")
+        log.info(f"[SENTIMENT] API Key starts with: {GROK_API_KEY[:10] if GROK_API_KEY else 'NONE'}...")
+        
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {GROK_API_KEY}"
@@ -642,8 +711,30 @@ Format response as JSON with this structure:
         )
         
         if response.status_code != 200:
-            log.error(f"[GROK ERROR] {response.status_code}: {response.text}")
-            return jsonify({"error": "Sentiment analysis failed"}), 500
+            log.error(f"[GROK ERROR] Status: {response.status_code}")
+            log.error(f"[GROK ERROR] Response: {response.text}")
+            
+            # Return user-friendly error based on status code
+            if response.status_code == 401:
+                return jsonify({
+                    "error": "Invalid Grok API key. Please check your GROK_API_KEY environment variable.",
+                    "details": "Authentication failed"
+                }), 401
+            elif response.status_code == 429:
+                return jsonify({
+                    "error": "Rate limit exceeded. Please try again in a few moments.",
+                    "details": "Too many requests"
+                }), 429
+            elif response.status_code == 403:
+                return jsonify({
+                    "error": "Access forbidden. Check if your Grok API key has sufficient credits.",
+                    "details": "Insufficient permissions or credits"
+                }), 403
+            else:
+                return jsonify({
+                    "error": f"Grok API error (Status: {response.status_code})",
+                    "details": response.text[:200] if response.text else "Unknown error"
+                }), 500
         
         result = response.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -663,9 +754,15 @@ Format response as JSON with this structure:
                 "raw": content
             })
     
+    except requests.exceptions.Timeout:
+        log.error(f"[SENTIMENT TIMEOUT] {sym}")
+        return jsonify({"error": "Request timeout - Grok API is taking too long. Please try again."}), 504
+    except requests.exceptions.RequestException as e:
+        log.error(f"[SENTIMENT REQUEST ERROR] {sym}: {e}")
+        return jsonify({"error": "Failed to connect to Grok API. Check your API key and internet connection."}), 500
     except Exception as e:
         log.error(f"[SENTIMENT ERROR] {sym}: {e}")
-        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+        return jsonify({"error": f"Sentiment analysis failed: {str(e)}"}), 500
 
 
 # ═══════ PROP RESEARCH ROUTES ═══════
