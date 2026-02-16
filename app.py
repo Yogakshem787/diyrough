@@ -607,75 +607,97 @@ def get_sentiment(symbol):
     sym = symbol.upper()
     
     # Build prompt for Grok
-    prompt = f"""You are a financial analyst. Today's date is February 16, 2026.
+    current_date = datetime.now().strftime("%B %d, %Y")
+    
+    prompt = f"""TODAY IS {current_date}. You are a financial analyst with REAL-TIME web search access.
 
-IMPORTANT: Use your web search capabilities to find the LATEST, MOST RECENT information about {sym} (Indian stock listed on NSE/BSE).
+🔍 MANDATORY WEB SEARCH INSTRUCTIONS:
 
-Search and analyze:
-1. Latest news articles from past 7 days (Economic Times, Moneycontrol, Business Standard, Mint)
-2. Recent Twitter/X posts and discussions about {sym}
-3. Latest broker reports and analyst recommendations
-4. Recent company announcements and quarterly results
-5. Current sector trends and developments
-6. Reddit discussions on Indian stock forums
+1. SEARCH Google for: "{sym} Q3 FY26 results" OR "{sym} Q3 FY2026 results" OR "{sym} quarterly results February 2026"
+2. SEARCH Google for: "{sym} latest news" (restrict to past 14 days)
+3. SEARCH Twitter/X for: "{sym}" OR "POLICYBZR" (if {sym} is ticker, search company name too)
+4. SEARCH Moneycontrol.com specifically: "site:moneycontrol.com {sym}"
+5. SEARCH Economic Times: "site:economictimes.indiatimes.com {sym}"
+6. SEARCH Reddit: "site:reddit.com/r/IndianStreetBets {sym}" AND "site:reddit.com/r/IndiaInvestments {sym}"
+7. SEARCH for company announcements: "{sym} NSE announcement" OR "{sym} BSE filing"
 
-For {sym}, provide a comprehensive sentiment analysis with CURRENT, UP-TO-DATE data covering:
+⚠️ CRITICAL RULES:
+- You MUST perform actual Google searches, not rely on training data
+- Search with multiple query variations if first search yields no results
+- For Indian stocks, also search by company full name (e.g., "PB Fintech" for POLICYBZR)
+- Check BOTH NSE and BSE websites for announcements
+- Look for Q3 FY26, Q3 FY2026, Q3 2025-26 (all formats)
+- Today is {current_date}, so "recent" means within last 14 days
 
-1. Social Media Sentiment (Twitter/X, Reddit, forums)
-   - What are people saying RIGHT NOW?
-   - Recent discussions and trends
-   - Retail investor sentiment
+📊 SPECIFIC THINGS TO SEARCH:
 
-2. News Sentiment (last 7 days)
-   - Latest news articles and coverage
-   - Recent company announcements
-   - Media tone and framing
+For {sym} (Indian stock):
 
-3. Analyst Sentiment (recent reports)
-   - Latest broker recommendations
-   - Recent upgrades/downgrades
-   - Current price target changes
+**Earnings/Results** (HIGHEST PRIORITY):
+- "{{sym}} Q3 results" + date range: Jan 15 - Feb 16, 2026
+- "{{sym}} quarterly results February 2026"
+- "{{sym}} earnings announcement"
+- Check: Moneycontrol earnings section, NSE/BSE filings
 
-4. Company Growth Prospects
-   - Latest business developments
-   - Recent expansion/acquisition news
-   - Current strategic initiatives
+**News** (past 14 days):
+- Economic Times articles about {{sym}}
+- Moneycontrol news on {{sym}}
+- Business Standard coverage of {{sym}}
+- Mint articles featuring {{sym}}
 
-5. Earnings Forecast
-   - Latest quarterly results
-   - Recent guidance updates
-   - Current consensus estimates
+**Social Media** (past 7 days):
+- Twitter/X: Search "{{sym}}" AND search company full name
+- Reddit r/IndianStreetBets: latest posts about {{sym}}
+- Reddit r/IndiaInvestments: discussions on {{sym}}
 
-6. Sector Sentiment
-   - Current sector trends
-   - Recent regulatory changes
-   - Industry developments
+**Analyst Coverage** (past 30 days):
+- "{{sym}} broker report" + February 2026
+- "{{sym}} price target" + upgrade/downgrade
+- "{{sym}} analyst recommendation" + recent
 
-For each category:
-- Provide current sentiment (Positive/Neutral/Negative)
-- Give score 1-10
-- List 2-3 SPECIFIC, RECENT points with dates/sources when possible
-- Include recent events or triggers from past 2-4 weeks
+**Company Actions**:
+- NSE/BSE announcements for {{sym}}
+- Company press releases
+- Investor presentations
 
-CRITICAL: Only use information from the past 30 days. Do NOT use outdated information. If you cannot find recent data, clearly state "Limited recent data available" for that category.
+🎯 OUTPUT REQUIREMENTS:
+
+1. If you find Q3 results: Include exact date, key numbers (revenue, profit, growth %), and source
+2. If you find news: Include headline, date, and source URL/publication
+3. If you find social discussions: Include platform, date, and sentiment
+4. For each data point: MUST include date and source
+5. If truly no data found after searching: Be explicit: "Searched X sources, found no results"
+
+⛔ DO NOT SAY "Limited recent data available" unless you:
+- Explicitly searched Google for the company
+- Checked Economic Times, Moneycontrol, Business Standard
+- Searched Twitter/X with both ticker and company name
+- Checked Reddit forums
+- Verified no NSE/BSE announcements
 
 Format response as JSON:
-{{
+{{{{
   "overall": "Positive/Neutral/Negative",
   "overallScore": 7,
-  "summary": "2-3 sentence summary with latest developments",
+  "summary": "Include specific dates and events found in search",
   "categories": [
-    {{
-      "name": "Social Media",
+    {{{{
+      "name": "Category Name",
       "sentiment": "Positive/Neutral/Negative",
       "score": 8,
-      "points": ["Specific recent point with date/context", "Another recent point"]
-    }}
+      "points": [
+        "Specific point WITH date and source (e.g., 'Feb 2, 2026: Q3 results...')",
+        "Another point with date and source"
+      ]
+    }}}}
   ],
-  "recentTriggers": ["Event 1 with date", "Event 2 with date"],
-  "recommendation": "Recommendation based on latest data",
-  "dataFreshness": "Mention most recent data sources and dates used"
-}}"""
+  "recentTriggers": ["Event with specific date"],
+  "recommendation": "Based on search findings",
+  "searchesPerformed": "List what you actually searched for",
+  "dataFreshness": "Mention date range of data and sources checked"
+}}}}
+
+🔍 SEARCH NOW for {sym} and provide analysis based on ACTUAL search results, not assumptions."""
 
     try:
         log.info(f"[SENTIMENT] Starting analysis for {sym}")
