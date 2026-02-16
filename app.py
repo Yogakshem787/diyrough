@@ -572,8 +572,6 @@ def admin_stats():
 @auth_required
 def get_sentiment(symbol):
     """Analyze stock sentiment using Grok API"""
-    if not g.user.is_pro():
-        return jsonify({"error": "Pro subscription required"}), 403
     
     if not GROK_API_KEY:
         return jsonify({"error": "Sentiment analysis not configured"}), 500
