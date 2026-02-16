@@ -720,7 +720,7 @@ Format response as JSON:
                     "content": prompt
                 }
             ],
-            "model": "grok-4-1-fast-reasoning",
+            "model": "grok-4-fast-reasoning",
             "stream": False,
             "temperature": 0.3
         }
