@@ -629,7 +629,7 @@ Format response as JSON with this structure:
                     "content": prompt
                 }
             ],
-            "model": "grok-beta",
+            "model": "grok-4-1-fast-reasoning",
             "stream": False,
             "temperature": 0.3
         }
