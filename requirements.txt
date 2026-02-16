@@ -1,0 +1,10 @@
+flask==3.1.0
+flask-cors==5.0.1
+flask-sqlalchemy==3.1.1
+psycopg2-binary
+psycopg[binary]
+sqlalchemy[postgresql_psycopg]
+PyJWT==2.9.0
+yfinance==1.1.0
+gunicorn==23.0.0
+requests==2.32.3
