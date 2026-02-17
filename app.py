@@ -1061,19 +1061,23 @@ def create_prop_research():
     """Admin: Create new prop research"""
     data = request.json or {}
     
+    # Accept both snake_case (admin form) and camelCase
+    def gd(snake, camel, default=""):
+        return data.get(snake, data.get(camel, default))
+
     research = PropResearch(
-        title=data.get("title", ""),
-        symbol=data.get("symbol", "").upper(),
-        sector=data.get("sector", ""),
-        thesis=data.get("thesis", ""),
-        target_cagr=data.get("targetCagr", 25),
-        time_horizon=data.get("timeHorizon", "1-3 years"),
-        entry_price=data.get("entryPrice", 0),
-        target_price=data.get("targetPrice", 0),
-        risks=data.get("risks", ""),
-        catalysts=data.get("catalysts", ""),
-        content=data.get("content", ""),
-        is_active=data.get("isActive", True),
+        title=       gd("title",        "title"),
+        symbol=      gd("symbol",       "symbol").upper(),
+        sector=      gd("sector",       "sector"),
+        thesis=      gd("thesis",       "thesis"),
+        target_cagr= gd("target_cagr",  "targetCagr",  25),
+        time_horizon=gd("time_horizon", "timeHorizon", "12"),
+        entry_price= gd("entry_price",  "entryPrice",  0),
+        target_price=gd("target_price", "targetPrice", 0),
+        risks=       gd("risks",        "risks"),
+        catalysts=   gd("catalysts",    "catalysts"),
+        content=     gd("content",      "content"),
+        is_active=   data.get("isActive", True),
     )
     
     db.session.add(research)
@@ -1093,18 +1097,21 @@ def update_prop_research(research_id):
         return jsonify({"error": "Not found"}), 404
     
     data = request.json or {}
-    research.title = data.get("title", research.title)
-    research.symbol = data.get("symbol", research.symbol).upper()
-    research.sector = data.get("sector", research.sector)
-    research.thesis = data.get("thesis", research.thesis)
-    research.target_cagr = data.get("targetCagr", research.target_cagr)
-    research.time_horizon = data.get("timeHorizon", research.time_horizon)
-    research.entry_price = data.get("entryPrice", research.entry_price)
-    research.target_price = data.get("targetPrice", research.target_price)
-    research.risks = data.get("risks", research.risks)
-    research.catalysts = data.get("catalysts", research.catalysts)
-    research.content = data.get("content", research.content)
-    research.is_active = data.get("isActive", research.is_active)
+    # Accept both snake_case (from form) and camelCase (legacy)
+    def get(snake, camel, default):
+        return data.get(snake, data.get(camel, default))
+    research.title       = get("title",        "title",       research.title)
+    research.symbol      = get("symbol",        "symbol",      research.symbol or "").upper()
+    research.sector      = get("sector",        "sector",      research.sector)
+    research.thesis      = get("thesis",        "thesis",      research.thesis)
+    research.target_cagr = get("target_cagr",   "targetCagr",  research.target_cagr)
+    research.time_horizon= get("time_horizon",  "timeHorizon", research.time_horizon)
+    research.entry_price = get("entry_price",   "entryPrice",  research.entry_price)
+    research.target_price= get("target_price",  "targetPrice", research.target_price)
+    research.risks       = get("risks",         "risks",       research.risks)
+    research.catalysts   = get("catalysts",     "catalysts",   research.catalysts)
+    research.content     = get("content",       "content",     research.content)
+    research.is_active   = get("isActive",      "isActive",    research.is_active)
     
     db.session.commit()
     return jsonify(research.to_dict())
