@@ -10,6 +10,9 @@ DIY Investing — Full Stack Backend v7
 """
 
 import os, time, math, logging, hashlib, secrets, json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -42,6 +45,11 @@ RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
 ADMIN_EMAILS = os.environ.get("ADMIN_EMAILS", "").split(",")  # comma-separated
+SMTP_HOST    = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT    = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER    = os.environ.get("SMTP_USER", "")          # your Gmail
+SMTP_PASS    = os.environ.get("SMTP_PASS", "")          # App-password
+FROM_NAME    = os.environ.get("FROM_NAME", "DIY Investing")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://diyinvesting.in")
 
 # Razorpay Payment Links (set these in environment variables)
@@ -317,6 +325,10 @@ def signup():
     db.session.add(u)
     db.session.commit()
     log.info(f"[SIGNUP] {email}")
+    try:
+        welcome_email(u)
+    except Exception as e:
+        log.warning(f"[SIGNUP EMAIL] {e}")
     return jsonify({"token": make_token(u), "user": u.to_dict()})
 
 
@@ -419,66 +431,12 @@ def update_profile():
 
 @app.route("/api/payment/links")
 def get_payment_links():
-    """Return Razorpay payment links"""
     return jsonify({
-        "monthly": RAZORPAY_MONTHLY_LINK,
+        "monthly":   RAZORPAY_MONTHLY_LINK,
         "quarterly": RAZORPAY_QUARTERLY_LINK,
-        "yearly": RAZORPAY_YEARLY_LINK,
+        "yearly":    RAZORPAY_YEARLY_LINK,
+        "return_url": FRONTEND_URL,
     })
-
-
-@app.route("/api/payment/webhook", methods=["POST"])
-def payment_webhook():
-    """Handle Razorpay webhooks for payment confirmation"""
-    try:
-        data = request.json or {}
-        event = data.get("event")
-        
-        if event == "payment_link.paid":
-            payload = data.get("payload", {})
-            payment_link = payload.get("payment_link", {})
-            payment = payload.get("payment", {})
-            
-            # Extract user email from payment link metadata or notes
-            notes = payment_link.get("notes", {})
-            email = notes.get("email", "")
-            plan = notes.get("plan", "monthly")
-            
-            if email:
-                user = User.query.filter_by(email=email).first()
-                if user:
-                    # Update user subscription
-                    if plan == "monthly":
-                        days = 30
-                    elif plan == "quarterly":
-                        days = 90
-                    elif plan == "yearly":
-                        days = 365
-                    else:
-                        days = 30
-                    
-                    user.plan = plan
-                    user.plan_expires = datetime.utcnow() + timedelta(days=days)
-                    user.razorpay_payment_id = payment.get("id", "")
-                    user.total_paid = (user.total_paid or 0) + (payment.get("amount", 0) / 100)
-                    
-                    # Record payment
-                    p = Payment(
-                        user_id=user.id,
-                        razorpay_payment_id=payment.get("id", ""),
-                        amount=payment.get("amount", 0) / 100,
-                        plan=plan,
-                        status="success",
-                    )
-                    db.session.add(p)
-                    db.session.commit()
-                    
-                    log.info(f"[PAYMENT SUCCESS] {email} - {plan}")
-        
-        return jsonify({"status": "ok"})
-    except Exception as e:
-        log.error(f"[WEBHOOK ERROR] {e}")
-        return jsonify({"error": str(e)}), 500
 
 
 # ═══════ WATCHLIST ROUTES ═══════
@@ -557,14 +515,135 @@ def admin_stats():
     revenue = db.session.query(db.func.sum(User.total_paid)).scalar() or 0
 
     recent = User.query.order_by(User.created_at.desc()).limit(50).all()
+    # Build payment history per user
+    payments_raw = Payment.query.order_by(Payment.created_at.desc()).all()
+    payment_map = {}
+    for p in payments_raw:
+        payment_map.setdefault(p.user_id, []).append({
+            "id": p.razorpay_payment_id,
+            "amount": p.amount,
+            "plan": p.plan,
+            "date": p.created_at.isoformat() if p.created_at else None,
+        })
+
+    users_data = []
+    for u in recent:
+        d = u.to_dict(include_private=True)
+        d["payments"] = payment_map.get(u.id, [])
+        users_data.append(d)
+
     return jsonify({
         "total": total,
         "trial": trial,
         "paid": paid,
         "revenue": round(revenue, 2),
-        "recent": [u.to_dict(include_private=True) for u in recent],
+        "recent": users_data,
+        "users": users_data,
     })
 
+
+
+
+@app.route("/api/admin/users")
+@auth_required
+@admin_required
+def admin_users():
+    """Return paginated user list with subscription and payment info."""
+    page  = request.args.get("page", 1, type=int)
+    limit = request.args.get("limit", 100, type=int)
+    plan_filter = request.args.get("plan", "")
+
+    q = User.query
+    if plan_filter:
+        q = q.filter_by(plan=plan_filter)
+    total = q.count()
+    users = q.order_by(User.created_at.desc()).offset((page-1)*limit).limit(limit).all()
+
+    payments_raw = Payment.query.filter(Payment.user_id.in_([u.id for u in users])).all()
+    payment_map = {}
+    for p in payments_raw:
+        payment_map.setdefault(p.user_id, []).append({
+            "id": p.razorpay_payment_id, "amount": p.amount,
+            "plan": p.plan, "date": p.created_at.isoformat() if p.created_at else None,
+        })
+
+    data = []
+    for u in users:
+        d = u.to_dict(include_private=True)
+        d["payments"] = payment_map.get(u.id, [])
+        data.append(d)
+
+    return jsonify({"total": total, "page": page, "users": data})
+
+
+@app.route("/api/admin/toggle-pro", methods=["POST"])
+@auth_required
+@admin_required
+def admin_toggle_pro():
+    """Manually grant or revoke Pro for a user."""
+    data = request.json or {}
+    uid     = data.get("user_id")
+    is_pro  = data.get("is_pro", True)
+    plan    = data.get("plan", "monthly")
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({"error": "User not found"}), 404
+    if is_pro:
+        u.plan = plan
+        u.plan_expires = datetime.utcnow() + timedelta(days=30)
+    else:
+        u.plan = "free"
+        u.plan_expires = None
+    db.session.commit()
+    log.info(f"[ADMIN] toggle-pro user={u.email} is_pro={is_pro}")
+    return jsonify({"ok": True, "user": u.to_dict()})
+
+
+@app.route("/api/admin/make-admin", methods=["POST"])
+@auth_required
+@admin_required
+def admin_make_admin():
+    """Grant admin rights to a user by email."""
+    email = (request.json or {}).get("email", "").strip().lower()
+    u = User.query.filter_by(email=email).first()
+    if not u:
+        return jsonify({"error": "User not found"}), 404
+    u.is_admin = True
+    db.session.commit()
+    log.info(f"[ADMIN] made admin: {email}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/payments")
+@auth_required
+@admin_required
+def admin_payments():
+    """Full payment history with analytics."""
+    payments = Payment.query.order_by(Payment.created_at.desc()).limit(200).all()
+    # Revenue by plan
+    monthly_rev   = sum(p.amount for p in payments if p.plan == "monthly")
+    quarterly_rev = sum(p.amount for p in payments if p.plan == "quarterly")
+    yearly_rev    = sum(p.amount for p in payments if p.plan == "yearly")
+    return jsonify({
+        "payments": [
+            {
+                "id": p.razorpay_payment_id,
+                "user_id": p.user_id,
+                "amount": p.amount,
+                "plan": p.plan,
+                "status": p.status,
+                "date": p.created_at.isoformat() if p.created_at else None,
+            } for p in payments
+        ],
+        "analytics": {
+            "total_revenue": round(monthly_rev + quarterly_rev + yearly_rev, 2),
+            "by_plan": {
+                "monthly": {"count": sum(1 for p in payments if p.plan=="monthly"), "revenue": round(monthly_rev,2)},
+                "quarterly": {"count": sum(1 for p in payments if p.plan=="quarterly"), "revenue": round(quarterly_rev,2)},
+                "yearly": {"count": sum(1 for p in payments if p.plan=="yearly"), "revenue": round(yearly_rev,2)},
+            }
+        }
+    })
 
 # ═══════ SENTIMENT ANALYSIS (GROK) ═══════
 
@@ -720,7 +799,7 @@ Format response as JSON:
                     "content": prompt
                 }
             ],
-            "model": "grok-4-fast-reasoning",
+            "model": "grok-4-1-fast-reasoning",
             "stream": False,
             "temperature": 0.3
         }
