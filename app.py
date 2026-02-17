@@ -25,7 +25,25 @@ import yfinance as yf
 
 # ═══════ CONFIG ═══════
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Content-Type", "Authorization"], "expose_headers": ["Content-Type"], "supports_credentials": True}})
+# Allowed origins — add every domain that hosts your frontend
+ALLOWED_ORIGINS = [
+    "https://stonksai.in",
+    "https://www.stonksai.in",
+    "http://localhost:3000",
+    "http://localhost:5000",
+    "http://127.0.0.1:5500",   # VS Code Live Server
+]
+# Also pull from env var so you can add more without redeploying
+_extra = os.environ.get("EXTRA_ORIGINS", "")
+if _extra:
+    ALLOWED_ORIGINS += [o.strip() for o in _extra.split(",") if o.strip()]
+
+CORS(app,
+     resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
+     allow_headers=["Content-Type", "Authorization"],
+     expose_headers=["Content-Type"],
+     supports_credentials=True,
+     max_age=3600)
 
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///diy.db")
@@ -37,6 +55,31 @@ elif app.config["SQLALCHEMY_DATABASE_URI"].startswith("postgresql://"):
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
+
+@app.after_request
+def add_cors_headers(response):
+    """Safety-net CORS headers — covers edge cases flask-cors misses."""
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"]      = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"]     = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"]     = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Vary"]                             = "Origin"
+    return response
+
+@app.route("/api/<path:path>", methods=["OPTIONS"])
+def handle_options(path):
+    """Handle all preflight OPTIONS requests."""
+    response = app.make_default_options_response()
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"]      = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"]     = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"]     = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Max-Age"]           = "3600"
+    return response
 
 PORT = int(os.environ.get("PORT", 10000))
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -269,7 +312,11 @@ def auth_required(f):
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not g.user or not g.user.is_admin:
+        if not g.user:
+            log.warning(f"[ADMIN] No user in context for {request.path}")
+            return jsonify({"error": "Login required"}), 401
+        if not g.user.is_admin:
+            log.warning(f"[ADMIN] Non-admin tried {request.path}: {g.user.email}")
             return jsonify({"error": "Admin access required"}), 403
         return f(*args, **kwargs)
     return decorated
@@ -277,9 +324,10 @@ def admin_required(f):
 
 # ═══════ CACHE ═══════
 cache = {}
-SEARCH_TTL = 3600
-QUOTE_TTL = 300
-FIN_TTL = 86400
+SEARCH_TTL = 7200    # search results: 2 hours
+QUOTE_TTL  = 900     # live quotes: 15 min (was 5 min)
+FIN_TTL    = 86400   # financials: 24 hours
+ERROR_TTL  = 120     # cache errors for 2 min to avoid hammering on failures
 
 def cached(key, ttl):
     if key in cache:
@@ -289,8 +337,8 @@ def cached(key, ttl):
         del cache[key]
     return None
 
-def set_cache(key, val):
-    cache[key] = (val, time.time() + QUOTE_TTL)
+def set_cache(key, val, ttl=None):
+    cache[key] = (val, time.time() + (ttl or QUOTE_TTL))
 
 
 # ═══════ AUTH ROUTES ═══════
@@ -1134,44 +1182,69 @@ def delete_prop_research(research_id):
 # ═══════ YFINANCE HELPERS ═══════
 
 def yf_quote(symbol):
-    ticker = symbol if "." in symbol else symbol + ".NS"
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info
-        if not info or not info.get("regularMarketPrice"):
-            if not ticker.endswith(".BO"):
-                ticker = symbol.replace(".NS", "") + ".BO"
-                t = yf.Ticker(ticker)
+    """Fetch live quote with retry + exponential backoff on rate limit."""
+    base = symbol.replace(".NS","").replace(".BO","")
+    tickers_to_try = [base + ".NS", base + ".BO"]
+    
+    for ticker in tickers_to_try:
+        # Check if this ticker is error-cached (rate limited recently)
+        err_key = f"err_{ticker}"
+        if cached(err_key, ERROR_TTL) is not None:
+            log.debug(f"[YF] Skipping {ticker} — error-cached")
+            continue
+        
+        for attempt in range(3):  # retry up to 3 times with backoff
+            try:
+                t    = yf.Ticker(ticker)
                 info = t.info
-                if not info or not info.get("regularMarketPrice"):
-                    return None
-
-        cmp = info.get("regularMarketPrice") or info.get("currentPrice") or 0
-        mcap = info.get("marketCap", 0)
-        shares = (mcap / cmp) if cmp > 0 else 0
-        mcap_cr = mcap / 1e7
-        shares_cr = shares / 1e7
-
-        return {
-            "cmp": round(cmp, 2),
-            "mcap_cr": round(mcap_cr, 2),
-            "shares_cr": round(shares_cr, 2),
-            "pe": round(info.get("trailingPE", 0) or 0, 2),
-            "eps": round(info.get("trailingEps", 0) or 0, 2),
-            "name": info.get("longName") or info.get("shortName") or symbol,
-            "sector": info.get("sector") or "",
-            "industry": info.get("industry") or "",
-            "change": round((info.get("regularMarketChange", 0) or 0), 2),
-            "changePct": round((info.get("regularMarketChangePercent", 0) or 0), 2),
-            "yearHigh": info.get("fiftyTwoWeekHigh", 0),
-            "yearLow": info.get("fiftyTwoWeekLow", 0),
-            "bookValue": info.get("bookValue", 0),
-            "dividendYield": round((info.get("dividendYield", 0) or 0) * 100, 2),
-            "currency": info.get("currency", "INR"),
-        }
-    except Exception as e:
-        log.error(f"[YF QUOTE ERROR] {ticker}: {e}")
-        return None
+                
+                if not info or len(info) < 5:
+                    break  # empty response, try next ticker
+                
+                cmp = (info.get("regularMarketPrice") or 
+                       info.get("currentPrice") or 
+                       info.get("previousClose") or 0)
+                if not cmp:
+                    break
+                
+                mcap     = info.get("marketCap", 0)
+                shares   = (mcap / cmp) if cmp > 0 else 0
+                
+                return {
+                    "cmp":          round(cmp, 2),
+                    "mcap_cr":      round(mcap / 1e7, 2),
+                    "shares_cr":    round(shares / 1e7, 2),
+                    "pe":           round(info.get("trailingPE", 0) or 0, 2),
+                    "eps":          round(info.get("trailingEps", 0) or 0, 2),
+                    "name":         info.get("longName") or info.get("shortName") or symbol,
+                    "sector":       info.get("sector") or "",
+                    "industry":     info.get("industry") or "",
+                    "change":       round(info.get("regularMarketChange", 0) or 0, 2),
+                    "changePct":    round(info.get("regularMarketChangePercent", 0) or 0, 2),
+                    "yearHigh":     info.get("fiftyTwoWeekHigh", 0),
+                    "yearLow":      info.get("fiftyTwoWeekLow", 0),
+                    "bookValue":    info.get("bookValue", 0),
+                    "dividendYield":round((info.get("dividendYield", 0) or 0) * 100, 2),
+                    "currency":     info.get("currency", "INR"),
+                    "_ticker":      ticker,
+                }
+                
+            except Exception as e:
+                err_str = str(e).lower()
+                if "too many requests" in err_str or "rate limit" in err_str or "429" in err_str:
+                    log.warning(f"[YF RATE LIMIT] {ticker} attempt {attempt+1}/3")
+                    # Cache the error so we don't hammer Yahoo
+                    set_cache(f"err_{ticker}", True, ERROR_TTL)
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)  # 1s, 2s backoff
+                    break  # don't retry rate limits beyond backoff
+                else:
+                    log.error(f"[YF QUOTE ERROR] {ticker} attempt {attempt+1}: {e}")
+                    if attempt < 2:
+                        time.sleep(0.5)
+    
+    log.warning(f"[YF] Could not fetch quote for {symbol}")
+    return None
 
 
 def yf_financials(symbol):
@@ -1259,7 +1332,13 @@ def fullstock(symbol):
     c = cached(ck, QUOTE_TTL)
     if c is not None: return jsonify(c)
 
+    # Fetch; on rate limit serve stale so user still sees data
     quote = yf_quote(sym)
+    if not quote:
+        stale = cached(f"stale:{ck}", 3600)
+        if stale:
+            log.info(f"[FULLSTOCK] Serving stale cache for {sym}")
+            return jsonify({**stale, "_stale": True})
     fck = f"fin:{sym}"
     years = cached(fck, FIN_TTL)
     if years is None:
@@ -1301,6 +1380,7 @@ def fullstock(symbol):
         except: pass
 
     set_cache(ck, result)
+    set_cache(f"stale:{ck}", result, 3600)  # keep stale copy for 1hr fallback
     return jsonify(result)
 
 
