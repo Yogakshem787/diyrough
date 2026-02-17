@@ -42,7 +42,8 @@ PORT = int(os.environ.get("PORT", 10000))
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_KEY_SECRET    = os.environ.get("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
 ADMIN_EMAILS = os.environ.get("ADMIN_EMAILS", "").split(",")  # comma-separated
 SMTP_HOST    = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -360,20 +361,59 @@ def google_auth():
         return jsonify({"error": "No credential"}), 400
 
     try:
-        r = requests.get(f"https://www.googleapis.com/oauth2/v3/tokeninfo?id_token={credential}")
-        if r.status_code != 200:
-            return jsonify({"error": "Invalid Google token"}), 400
-        info = r.json()
-        email = info.get("email", "").lower()
-        name = info.get("name", "")
-        picture = info.get("picture", "")
+        # Use Google's tokeninfo endpoint with retry logic
+        info = None
+        last_error = None
+        
+        for attempt in range(3):  # retry up to 3 times
+            try:
+                r = requests.get(
+                    f"https://oauth2.googleapis.com/tokeninfo?id_token={credential}",
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    info = r.json()
+                    break
+                else:
+                    # Try alternative endpoint
+                    r2 = requests.get(
+                        f"https://www.googleapis.com/oauth2/v3/tokeninfo?id_token={credential}",
+                        timeout=10
+                    )
+                    if r2.status_code == 200:
+                        info = r2.json()
+                        break
+                    last_error = f"Status {r.status_code}: {r.text[:100]}"
+            except Exception as e:
+                last_error = str(e)
+                time.sleep(0.5)
+        
+        if not info:
+            log.error(f"[GOOGLE] Token validation failed after 3 attempts: {last_error}")
+            return jsonify({"error": "Could not verify Google token. Please try again."}), 400
+
+        # Verify audience if client ID is configured
+        aud = info.get("aud", "")
+        if GOOGLE_CLIENT_ID and aud and aud != GOOGLE_CLIENT_ID:
+            log.error(f"[GOOGLE] Audience mismatch: {aud}")
+            return jsonify({"error": "Invalid Google token audience"}), 400
+
+        email     = info.get("email", "").lower()
+        name      = info.get("name", "") or info.get("given_name", "")
+        picture   = info.get("picture", "")
         google_id = info.get("sub", "")
 
         if not email:
             return jsonify({"error": "No email from Google"}), 400
+        
+        # Email must be verified by Google
+        if info.get("email_verified") == "false":
+            return jsonify({"error": "Google email not verified"}), 400
 
         u = User.query.filter_by(email=email).first()
+        is_new = False
         if not u:
+            is_new = True
             u = User(
                 email=email,
                 name=name,
@@ -385,17 +425,25 @@ def google_auth():
             )
             db.session.add(u)
         else:
-            u.google_id = google_id
-            u.avatar_url = picture
+            u.google_id   = google_id
+            u.avatar_url  = picture
+            if not u.name and name:
+                u.name = name
 
         u.login_count = (u.login_count or 0) + 1
-        u.last_login = datetime.utcnow()
+        u.last_login  = datetime.utcnow()
         db.session.commit()
-        log.info(f"[GOOGLE LOGIN] {email}")
+        
+        if is_new:
+            try: welcome_email(u)
+            except Exception as e: log.warning(f"[GOOGLE WELCOME EMAIL] {e}")
+
+        log.info(f"[GOOGLE LOGIN] {email} (new={is_new})")
         return jsonify({"token": make_token(u), "user": u.to_dict()})
+
     except Exception as e:
-        log.error(f"[GOOGLE ERROR] {e}")
-        return jsonify({"error": "Google login failed"}), 500
+        log.error(f"[GOOGLE ERROR] {str(e)}", exc_info=True)
+        return jsonify({"error": "Google login failed. Please try again or use email login."}), 500
 
 
 @app.route("/api/auth/me")
@@ -436,6 +484,124 @@ def get_payment_links():
         "quarterly": RAZORPAY_QUARTERLY_LINK,
         "yearly":    RAZORPAY_YEARLY_LINK,
         "return_url": FRONTEND_URL,
+    })
+
+
+
+# ═══════ PAYMENT WEBHOOK ═══════
+
+@app.route("/api/payment/webhook", methods=["POST"])
+def payment_webhook():
+    """
+    Razorpay webhook for payment_link.paid events.
+    CRITICAL: This is how the system knows a user has paid.
+    Configure in Razorpay Dashboard → Webhooks → Add URL → /api/payment/webhook
+    Subscribe to: payment_link.paid
+    """
+    try:
+        # Verify Razorpay signature if secret is configured
+        if RAZORPAY_WEBHOOK_SECRET:
+            import hmac, hashlib as hl
+            sig = request.headers.get("X-Razorpay-Signature", "")
+            body = request.get_data()
+            expected = hmac.new(
+                RAZORPAY_WEBHOOK_SECRET.encode(),
+                body,
+                hl.sha256
+            ).hexdigest()
+            if sig and sig != expected:
+                log.error("[WEBHOOK] Signature mismatch - possible fake webhook")
+                return jsonify({"error": "Invalid signature"}), 400
+
+        data  = request.json or {}
+        event = data.get("event", "")
+        log.info(f"[WEBHOOK] Event received: {event}")
+
+        if event == "payment_link.paid":
+            payload      = data.get("payload", {})
+            payment_link = payload.get("payment_link", {}).get("entity", 
+                           payload.get("payment_link", {}))
+            payment      = payload.get("payment", {}).get("entity",
+                           payload.get("payment", {}))
+
+            # Extract email — Razorpay stores it in notes or customer details
+            notes  = payment_link.get("notes", {}) or {}
+            email  = (notes.get("email") or 
+                      payment_link.get("customer", {}).get("email") or
+                      payment.get("email") or "").strip().lower()
+            plan   = (notes.get("plan") or 
+                      payment_link.get("description", "monthly").lower().split()[0] or
+                      "monthly")
+            amount = payment.get("amount", 0) / 100  # paise to rupees
+            pay_id = payment.get("id", "")
+
+            log.info(f"[WEBHOOK] Payment: email={email}, plan={plan}, amount=₹{amount}, id={pay_id}")
+
+            if not email:
+                log.error("[WEBHOOK] No email in payment - cannot update user")
+                # Still return 200 so Razorpay doesn't retry infinitely
+                return jsonify({"status": "ok", "warning": "no_email"})
+
+            user = User.query.filter_by(email=email).first()
+            if not user:
+                log.error(f"[WEBHOOK] User not found for email: {email}")
+                return jsonify({"status": "ok", "warning": "user_not_found"})
+
+            # Map plan to days
+            days_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
+            days = days_map.get(plan, 30)
+
+            # If already pro, extend from current expiry instead of now
+            if user.is_pro() and user.plan_expires and user.plan_expires > datetime.utcnow():
+                user.plan_expires = user.plan_expires + timedelta(days=days)
+            else:
+                user.plan_expires = datetime.utcnow() + timedelta(days=days)
+            
+            user.plan = plan
+            user.razorpay_payment_id = pay_id
+            user.total_paid = (user.total_paid or 0) + amount
+
+            # Record in payments table (prevent duplicate recording)
+            existing_payment = Payment.query.filter_by(razorpay_payment_id=pay_id).first()
+            if not existing_payment:
+                p = Payment(
+                    user_id=user.id,
+                    razorpay_payment_id=pay_id,
+                    amount=amount,
+                    plan=plan,
+                    status="success",
+                )
+                db.session.add(p)
+
+            db.session.commit()
+            log.info(f"[WEBHOOK] ✅ Upgraded {email} to {plan} until {user.plan_expires.date()}")
+
+            # Send confirmation email
+            try: subscription_email(user, plan, amount)
+            except Exception as e: log.warning(f"[WEBHOOK EMAIL] {e}")
+
+        return jsonify({"status": "ok"})
+
+    except Exception as e:
+        log.error(f"[WEBHOOK ERROR] {e}", exc_info=True)
+        # Return 200 anyway so Razorpay doesn't keep retrying
+        return jsonify({"status": "ok", "error": str(e)})
+
+
+@app.route("/api/payment/verify", methods=["POST"])
+@auth_required
+def verify_payment():
+    """
+    Frontend polls this after returning from Razorpay to check if webhook 
+    has processed and user is now Pro. Returns fresh user data.
+    """
+    # Refresh user from DB (not from token cache)
+    fresh_user = User.query.get(g.user.id)
+    return jsonify({
+        "user": fresh_user.to_dict(),
+        "isPro": fresh_user.is_pro(),
+        "plan": fresh_user.plan,
+        "planExpires": fresh_user.plan_expires.isoformat() if fresh_user.plan_expires else None,
     })
 
 
