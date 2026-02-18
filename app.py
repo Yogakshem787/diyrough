@@ -212,6 +212,49 @@ class WatchlistItem(db.Model):
         }
 
 
+class Portfolio(db.Model):
+    """User's actual stock holdings for portfolio tracking + DCF analysis."""
+    __tablename__ = "portfolio"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    symbol = db.Column(db.String(30), nullable=False, index=True)
+    name = db.Column(db.String(255), default="")
+    sector = db.Column(db.String(100), default="")
+    
+    # Purchase details
+    quantity = db.Column(db.Float, nullable=False)  # number of shares
+    buy_price = db.Column(db.Float, nullable=False)  # price per share when bought
+    buy_date = db.Column(db.Date, nullable=False)
+    
+    # Current data (refreshed when user opens portfolio)
+    current_price = db.Column(db.Float, default=0)
+    
+    # DCF inputs saved with this holding
+    exit_pe = db.Column(db.Float, default=20)
+    discount_rate = db.Column(db.Float, default=15)
+    forecast_years = db.Column(db.Float, default=10)
+    
+    # Metadata
+    added_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "symbol": self.symbol,
+            "name": self.name,
+            "sector": self.sector,
+            "quantity": self.quantity,
+            "buyPrice": self.buy_price,
+            "buyDate": self.buy_date.isoformat() if self.buy_date else None,
+            "currentPrice": self.current_price,
+            "exitPe": self.exit_pe,
+            "discountRate": self.discount_rate,
+            "forecastYears": self.forecast_years,
+            "addedAt": self.added_at.isoformat() if self.added_at else None,
+        }
+
+
 class Payment(db.Model):
     __tablename__ = "payments"
     id = db.Column(db.Integer, primary_key=True)
@@ -715,6 +758,363 @@ def delete_watchlist(item_id):
     db.session.commit()
     items = WatchlistItem.query.filter_by(user_id=g.user.id).order_by(WatchlistItem.added_at.desc()).all()
     return jsonify([item.to_dict() for item in items])
+
+
+
+# ═══════ PORTFOLIO ROUTES ═══════
+
+@app.route("/api/portfolio")
+@auth_required
+def get_portfolio():
+    """Get user's portfolio holdings with live DCF analysis."""
+    holdings = Portfolio.query.filter_by(user_id=g.user.id).order_by(Portfolio.buy_date.desc()).all()
+    
+    result = []
+    for h in holdings:
+        # Get live quote for current price
+        quote = yf_quote(h.symbol)
+        if quote:
+            h.current_price = quote.get('cmp', 0)
+            db.session.commit()
+        
+        # Get latest PAT for DCF calculation
+        sym = h.symbol.upper()
+        fck = f"fin:{sym}"
+        years = cached(fck, FIN_TTL)
+        if years is None:
+            years = yf_financials(sym)
+            if years:
+                set_cache(fck, years, FIN_TTL)
+        
+        pat = years[0].get('pat', 0) if years and len(years) > 0 else 0
+        
+        # Calculate DCF metrics
+        invested = h.quantity * h.buy_price
+        current_value = h.quantity * h.current_price
+        pnl = current_value - invested
+        pnl_pct = (pnl / invested * 100) if invested > 0 else 0
+        
+        # Implied growth calculation
+        implied_growth = None
+        if pat > 0 and h.current_price > 0:
+            shares_cr = 0
+            if quote and quote.get('shares_cr'):
+                shares_cr = quote.get('shares_cr')
+            elif quote and quote.get('mcap_cr'):
+                shares_cr = quote['mcap_cr'] / h.current_price if h.current_price > 0 else 0
+            
+            if shares_cr > 0:
+                mcap = h.current_price * shares_cr
+                implied_growth = solveGrowth(
+                    pat, mcap, h.discount_rate, h.forecast_years, h.exit_pe
+                )
+        
+        result.append({
+            **h.to_dict(),
+            "invested": round(invested, 2),
+            "currentValue": round(current_value, 2),
+            "pnl": round(pnl, 2),
+            "pnlPct": round(pnl_pct, 2),
+            "pat": pat,
+            "impliedGrowth": implied_growth,
+        })
+    
+    return jsonify(result)
+
+
+@app.route("/api/portfolio", methods=["POST"])
+@auth_required
+def add_portfolio_holding():
+    """Add a new stock holding to portfolio."""
+    data = request.json or {}
+    
+    symbol = data.get("symbol", "").upper().strip()
+    quantity = data.get("quantity")
+    buy_price = data.get("buyPrice")
+    buy_date = data.get("buyDate")  # ISO format "2024-01-15"
+    
+    if not symbol or not quantity or not buy_price or not buy_date:
+        return jsonify({"error": "Symbol, quantity, buyPrice, and buyDate required"}), 400
+    
+    try:
+        quantity = float(quantity)
+        buy_price = float(buy_price)
+        buy_date_obj = datetime.fromisoformat(buy_date.split('T')[0])
+    except:
+        return jsonify({"error": "Invalid quantity, price, or date format"}), 400
+    
+    # Get stock name from quote or use symbol
+    quote = yf_quote(symbol)
+    name = quote.get('name', symbol) if quote else symbol
+    sector = quote.get('sector', '') if quote else ''
+    current_price = quote.get('cmp', buy_price) if quote else buy_price
+    
+    holding = Portfolio(
+        user_id=g.user.id,
+        symbol=symbol,
+        name=name,
+        sector=sector,
+        quantity=quantity,
+        buy_price=buy_price,
+        buy_date=buy_date_obj,
+        current_price=current_price,
+        exit_pe=data.get("exitPe", 20),
+        discount_rate=data.get("discountRate", 15),
+        forecast_years=data.get("forecastYears", 10),
+    )
+    
+    db.session.add(holding)
+    db.session.commit()
+    
+    log.info(f"[PORTFOLIO] Added {symbol} for user {g.user.email}")
+    
+    # Return updated portfolio
+    return get_portfolio()
+
+
+@app.route("/api/portfolio/<int:holding_id>", methods=["PUT"])
+@auth_required
+def update_portfolio_holding(holding_id):
+    """Update DCF parameters or quantity for a holding."""
+    holding = Portfolio.query.filter_by(id=holding_id, user_id=g.user.id).first()
+    if not holding:
+        return jsonify({"error": "Holding not found"}), 404
+    
+    data = request.json or {}
+    
+    if "quantity" in data:
+        holding.quantity = float(data["quantity"])
+    if "exitPe" in data:
+        holding.exit_pe = float(data["exitPe"])
+    if "discountRate" in data:
+        holding.discount_rate = float(data["discountRate"])
+    if "forecastYears" in data:
+        holding.forecast_years = float(data["forecastYears"])
+    
+    holding.updated_at = datetime.utcnow()
+    db.session.commit()
+    
+    return get_portfolio()
+
+
+@app.route("/api/portfolio/<int:holding_id>", methods=["DELETE"])
+@auth_required
+def delete_portfolio_holding(holding_id):
+    """Remove a holding from portfolio."""
+    holding = Portfolio.query.filter_by(id=holding_id, user_id=g.user.id).first()
+    if not holding:
+        return jsonify({"error": "Holding not found"}), 404
+    
+    db.session.delete(holding)
+    db.session.commit()
+    
+    log.info(f"[PORTFOLIO] Deleted {holding.symbol} for user {g.user.email}")
+    
+    return get_portfolio()
+
+
+@app.route("/api/portfolio/upload-csv", methods=["POST"])
+@auth_required
+def upload_portfolio_csv():
+    """
+    Parse CSV from any broker (Zerodha, Groww, Upstox, Angel One, etc.)
+    and bulk import holdings into portfolio.
+    
+    Supports flexible formats - intelligently detects columns.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    
+    file = request.files["file"]
+    if file.filename == "" or not file.filename.endswith(".csv"):
+        return jsonify({"error": "Please upload a CSV file"}), 400
+    
+    try:
+        # Read CSV content
+        import csv
+        import io
+        stream = io.StringIO(file.stream.read().decode("utf-8"), newline=None)
+        csv_reader = csv.DictReader(stream)
+        
+        # Detect column mappings (different brokers use different headers)
+        headers = [h.strip().lower() for h in csv_reader.fieldnames] if csv_reader.fieldnames else []
+        
+        if not headers:
+            return jsonify({"error": "CSV file is empty or has no headers"}), 400
+        
+        # Column mapping patterns (flexible matching)
+        def find_column(patterns, headers):
+            for pattern in patterns:
+                for h in headers:
+                    if re.search(pattern, h, re.IGNORECASE):
+                        return h
+            return None
+        
+        symbol_col = find_column([
+            r'^symbol', r'^stock.*symbol', r'^trading.*symbol', r'^scrip', 
+            r'^isin', r'^instrument'
+        ], headers)
+        
+        qty_col = find_column([
+            r'^qty', r'^quantity', r'^shares', r'^holding.*qty', r'^net.*qty'
+        ], headers)
+        
+        avg_price_col = find_column([
+            r'^avg.*price', r'^average.*price', r'^buy.*price', r'^purchase.*price',
+            r'^price', r'^rate'
+        ], headers)
+        
+        # Optional columns
+        name_col = find_column([
+            r'^name', r'^company', r'^stock.*name', r'^scrip.*name'
+        ], headers)
+        
+        date_col = find_column([
+            r'^date', r'^buy.*date', r'^purchase.*date', r'^trade.*date'
+        ], headers)
+        
+        # Validation
+        if not symbol_col:
+            return jsonify({
+                "error": "Could not find Symbol/Stock column. Headers found: " + ", ".join(headers[:5])
+            }), 400
+        
+        if not qty_col:
+            return jsonify({
+                "error": "Could not find Quantity/Shares column. Headers found: " + ", ".join(headers[:5])
+            }), 400
+        
+        if not avg_price_col:
+            return jsonify({
+                "error": "Could not find Price/Average Price column. Headers found: " + ", ".join(headers[:5])
+            }), 400
+        
+        # Parse rows
+        added = 0
+        skipped = 0
+        errors = []
+        
+        for i, row in enumerate(csv_reader, start=2):  # start=2 because row 1 is headers
+            try:
+                # Extract data
+                symbol_raw = row.get(symbol_col, "").strip().upper()
+                qty_raw = row.get(qty_col, "").strip()
+                price_raw = row.get(avg_price_col, "").strip()
+                
+                # Clean symbol (remove .NS, .BO, exchange info)
+                symbol = re.sub(r'\.(NS|BO|BSE|NSE)$', '', symbol_raw)
+                symbol = re.sub(r'[^A-Z0-9&-]', '', symbol)  # Keep only alphanumeric, &, -
+                
+                if not symbol or symbol == "" or len(symbol) > 30:
+                    skipped += 1
+                    continue
+                
+                # Parse quantity
+                try:
+                    qty_clean = re.sub(r'[^\d.-]', '', qty_raw)
+                    quantity = float(qty_clean)
+                    if quantity <= 0:
+                        skipped += 1
+                        continue
+                except:
+                    skipped += 1
+                    continue
+                
+                # Parse price
+                try:
+                    price_clean = re.sub(r'[^\d.-]', '', price_raw)
+                    buy_price = float(price_clean)
+                    if buy_price <= 0:
+                        skipped += 1
+                        continue
+                except:
+                    skipped += 1
+                    continue
+                
+                # Parse date (optional)
+                buy_date = None
+                if date_col and row.get(date_col):
+                    date_str = row.get(date_col, "").strip()
+                    # Try multiple date formats
+                    for fmt in ["%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%Y"]:
+                        try:
+                            buy_date = datetime.strptime(date_str, fmt).date()
+                            break
+                        except:
+                            continue
+                
+                if not buy_date:
+                    buy_date = datetime.utcnow().date()  # Default to today
+                
+                # Check if holding already exists (same symbol)
+                existing = Portfolio.query.filter_by(
+                    user_id=g.user.id, 
+                    symbol=symbol
+                ).first()
+                
+                if existing:
+                    # Update quantity (aggregate multiple purchases)
+                    total_qty = existing.quantity + quantity
+                    # Weighted average price
+                    total_cost = (existing.quantity * existing.buy_price) + (quantity * buy_price)
+                    existing.quantity = total_qty
+                    existing.buy_price = total_cost / total_qty
+                    existing.updated_at = datetime.utcnow()
+                    log.info(f"[CSV] Updated {symbol}: qty {total_qty}")
+                else:
+                    # Get stock name from yfinance (optional, don't fail if it doesn't work)
+                    stock_name = row.get(name_col, symbol) if name_col else symbol
+                    sector = ""
+                    
+                    # Try to fetch from yfinance (but don't block on rate limits)
+                    try:
+                        quote = yf_quote(symbol)
+                        if quote:
+                            stock_name = quote.get('name', stock_name)
+                            sector = quote.get('sector', '')
+                    except:
+                        pass  # Continue even if yfinance fails
+                    
+                    # Create new holding
+                    holding = Portfolio(
+                        user_id=g.user.id,
+                        symbol=symbol,
+                        name=stock_name,
+                        sector=sector,
+                        quantity=quantity,
+                        buy_price=buy_price,
+                        buy_date=buy_date,
+                        current_price=buy_price,  # Will be updated on next portfolio load
+                        exit_pe=20,
+                        discount_rate=15,
+                        forecast_years=10,
+                    )
+                    db.session.add(holding)
+                    log.info(f"[CSV] Added {symbol}: {quantity} @ ₹{buy_price}")
+                
+                added += 1
+                
+            except Exception as e:
+                errors.append(f"Row {i}: {str(e)[:50]}")
+                skipped += 1
+                continue
+        
+        db.session.commit()
+        
+        log.info(f"[CSV UPLOAD] User {g.user.email}: {added} added, {skipped} skipped")
+        
+        return jsonify({
+            "success": True,
+            "added": added,
+            "skipped": skipped,
+            "errors": errors[:5] if errors else [],  # Return first 5 errors only
+            "message": f"Successfully imported {added} holdings. {skipped} rows skipped.",
+        })
+        
+    except Exception as e:
+        log.error(f"[CSV UPLOAD ERROR] {e}", exc_info=True)
+        return jsonify({"error": f"Failed to parse CSV: {str(e)}"}), 400
+
 
 
 # ═══════ ADMIN ROUTES ═══════
@@ -1310,6 +1710,36 @@ def calc_cagr(arr, field, n):
     a, b = arr[0].get(field, 0), arr[n].get(field, 0)
     if not b or b <= 0 or not a or a <= 0: return None
     return round((math.pow(a / b, 1 / n) - 1) * 100, 1)
+
+
+def calcValue(pat, gPct, rPct, n, pe):
+    """DCF calculation: present value of future cash flows."""
+    if pat <= 0 or pe <= 0 or n <= 0: return 0
+    g, r = gPct / 100, rPct / 100
+    pv = 0
+    if abs(r - g) < 1e-6:
+        for t in range(1, int(n) + 1):
+            pv += (pat * math.pow(1 + g, t)) / math.pow(1 + r, t)
+    else:
+        pv = pat * (1 + g) * ((1 - math.pow(1 + g, n) * math.pow(1 + r, -n)) / (r - g))
+    terminal = (pat * math.pow(1 + g, n) * pe) / math.pow(1 + r, n)
+    return pv + terminal
+
+
+def solveGrowth(pat, mcap, rPct, n, pe):
+    """Reverse DCF: given market cap, solve for implied growth rate."""
+    if pat <= 0 or mcap <= 0 or pe <= 0: return None
+    lo, hi = -90, 200
+    for _ in range(500):
+        mid = (lo + hi) / 2
+        val = calcValue(pat, mid, rPct, n, pe)
+        if abs(val - mcap) < mcap * 0.000001:
+            return round(mid, 2)
+        if val < mcap:
+            lo = mid
+        else:
+            hi = mid
+    return round((lo + hi) / 2, 2)
 
 
 # Stock API routes
