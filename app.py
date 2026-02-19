@@ -74,6 +74,14 @@ if app.config["SQLALCHEMY_DATABASE_URI"].startswith("postgres://"):
 elif app.config["SQLALCHEMY_DATABASE_URI"].startswith("postgresql://"):
     app.config["SQLALCHEMY_DATABASE_URI"] = app.config["SQLALCHEMY_DATABASE_URI"].replace("postgresql://", "postgresql+psycopg://", 1)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+# Fix stale SSL connections after Render restart (SSL error: decryption failed)
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_recycle": 280,      # recycle connections every ~5 min (before Render's timeout)
+    "pool_pre_ping": True,    # test connection before using it
+    "pool_size": 5,
+    "max_overflow": 10,
+    "connect_args": {"connect_timeout": 10},
+}
 
 db = SQLAlchemy(app)
 
@@ -2097,10 +2105,13 @@ def _nse_direct_quote(symbol):
     base = symbol.replace(".NS", "").replace(".BO", "").upper()
     s = _get_nse_session()
     if not s:
+        log.debug(f"[NSE DIRECT] No session available for {base}")
         return None
     
     try:
-        url = f"https://www.nseindia.com/api/quote-equity?symbol={base}"
+        from urllib.parse import quote as url_quote
+        encoded_sym = url_quote(base)
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={encoded_sym}"
         r = s.get(url, timeout=12)
         
         if r.status_code == 403:
@@ -2110,14 +2121,20 @@ def _nse_direct_quote(symbol):
             s = _get_nse_session()
             if s:
                 r = s.get(url, timeout=12)
+            else:
+                return None
         
         if r.status_code != 200:
-            log.warning(f"[NSE DIRECT] {base} status={r.status_code}")
+            log.warning(f"[NSE DIRECT] {base} HTTP {r.status_code}")
             return None
         
         data = r.json()
-        pi = data.get("priceInfo", {})
-        info = data.get("info", {}) or data.get("metadata", {}) or {}
+        if not data:
+            return None
+        
+        pi = data.get("priceInfo", {}) or {}
+        metadata = data.get("metadata", {}) or {}
+        info = data.get("info", {}) or metadata
         industry_info = data.get("industryInfo", {}) or {}
         sec_info = data.get("securityInfo", {}) or {}
         
@@ -2129,46 +2146,53 @@ def _nse_direct_quote(symbol):
         change = round(cmp - prev_close, 2) if prev_close else 0
         change_pct = round((change / prev_close) * 100, 2) if prev_close else 0
         
-        # Calculate market cap from issued size or traded info
-        issued_size = sec_info.get("issuedSize") or 0
-        mcap = cmp * issued_size if issued_size else 0
-        shares = issued_size
-        
-        wk_high_low = pi.get("weekHighLow", {}) or {}
-        
-        pe = info.get("pdSymbolPe") or info.get("pe") or 0
+        # Shares outstanding from securityInfo
+        issued_size = sec_info.get("issuedSize") or sec_info.get("issuedCap") or 0
         try:
-            pe = float(pe) if pe else 0
+            issued_size = int(issued_size) if issued_size else 0
+        except:
+            issued_size = 0
+        mcap = cmp * issued_size if issued_size else 0
+        
+        wk = pi.get("weekHighLow", {}) or {}
+        
+        # PE from metadata (NSE stores it there)
+        pe = metadata.get("pdSymbolPe") or metadata.get("pe") or info.get("pdSymbolPe") or 0
+        try:
+            pe = float(str(pe).replace(",", "")) if pe else 0
         except:
             pe = 0
         
         sector = (industry_info.get("macro") or 
                   industry_info.get("sector") or 
-                  info.get("industry") or "")
+                  metadata.get("industry") or "")
         industry = (industry_info.get("basicIndustry") or 
                     industry_info.get("industry") or "")
+        company_name = (info.get("companyName") or 
+                        metadata.get("companyName") or 
+                        metadata.get("symbol") or base)
         
         result = {
             "cmp":          round(cmp, 2),
             "mcap_cr":      round(mcap / 1e7, 2) if mcap else 0,
-            "shares_cr":    round(shares / 1e7, 2) if shares else 0,
+            "shares_cr":    round(issued_size / 1e7, 2) if issued_size else 0,
             "pe":           round(pe, 2),
             "eps":          round(cmp / pe, 2) if pe and pe > 0 else 0,
-            "name":         info.get("companyName") or info.get("symbol") or base,
+            "name":         company_name,
             "sector":       sector,
             "industry":     industry,
             "change":       change,
             "changePct":    change_pct,
-            "yearHigh":     wk_high_low.get("max") or 0,
-            "yearLow":      wk_high_low.get("min") or 0,
-            "bookValue":    0,  # not in NSE quote endpoint
-            "dividendYield": 0,  # not in NSE quote endpoint
+            "yearHigh":     wk.get("max") or 0,
+            "yearLow":      wk.get("min") or 0,
+            "bookValue":    0,
+            "dividendYield": 0,
             "currency":     "INR",
             "_source":      "nse_direct",
             "_ticker":      base + ".NS",
         }
         
-        log.info(f"[NSE DIRECT] ✅ {base}: ₹{cmp}")
+        log.info(f"[NSE DIRECT] ✅ {base}: ₹{cmp} | mcap={result['mcap_cr']}Cr | pe={pe}")
         return result
         
     except requests.exceptions.Timeout:
@@ -2182,17 +2206,35 @@ def _nse_direct_quote(symbol):
 def _nsetools_quote(symbol):
     """
     Fetch quote via nsetools library (wraps NSE APIs cleanly).
-    Fallback if direct NSE HTTP fails.
+    Uses all_data=True to get securityInfo (shares) + metadata (PE).
     """
     base = symbol.replace(".NS", "").replace(".BO", "").upper()
     try:
         from nsetools import Nse
         nse = Nse()
+        
+        # all_data=True returns the full NSE response with securityInfo, metadata, etc.
         q = nse.get_quote(base, all_data=True)
         if not q:
             return None
         
-        pi = q.get("priceInfo", q)  # v2.0 returns nested structure
+        # The response structure from nsetools v2.0 with all_data=True:
+        # {
+        #   "priceInfo": { "lastPrice", "previousClose", "weekHighLow": {"min","max"}, ... },
+        #   "securityInfo": { "issuedSize": 12345678, ... },
+        #   "metadata": { "companyName", "industry", "pdSymbolPe", ... },
+        #   "industryInfo": { "macro", "sector", "basicIndustry", ... },
+        #   "info": { ... }  (in some versions)
+        # }
+        # BUT if all_data is not supported in this version, it returns flat dict:
+        # { "lastPrice", "previousClose", "change", "pChange", "companyName", ... }
+        
+        pi = q.get("priceInfo", {}) or {}
+        metadata = q.get("metadata", {}) or {}
+        sec_info = q.get("securityInfo", {}) or {}
+        ind_info = q.get("industryInfo", {}) or {}
+        
+        # Price — try nested first, then flat
         cmp = (pi.get("lastPrice") or pi.get("close") or 
                q.get("lastPrice") or q.get("close") or 0)
         
@@ -2200,27 +2242,59 @@ def _nsetools_quote(symbol):
             return None
         
         prev_close = pi.get("previousClose") or q.get("previousClose") or 0
-        change = round(cmp - prev_close, 2) if prev_close else 0
-        change_pct = round((change / prev_close) * 100, 2) if prev_close else 0
+        change = q.get("change") or (round(cmp - prev_close, 2) if prev_close else 0)
+        change_pct = q.get("pChange") or (round((change / prev_close) * 100, 2) if prev_close else 0)
         
-        # Try to get 52-week data
+        # 52-week high/low
         wk = pi.get("weekHighLow", {}) or q.get("weekHighLow", {}) or {}
+        year_high = wk.get("max") or 0
+        year_low = wk.get("min") or 0
+        # Handle case where max/min might be dicts with 'value' key
+        if isinstance(year_high, dict):
+            year_high = year_high.get("value", 0)
+        if isinstance(year_low, dict):
+            year_low = year_low.get("value", 0)
         
-        ind_info = q.get("industryInfo", {}) or {}
+        # Shares outstanding from securityInfo
+        issued_size = sec_info.get("issuedSize") or sec_info.get("issuedCap") or 0
+        try:
+            issued_size = int(issued_size) if issued_size else 0
+        except:
+            issued_size = 0
+        mcap = cmp * issued_size if issued_size else 0
+        
+        # PE from metadata
+        pe = metadata.get("pdSymbolPe") or metadata.get("pe") or q.get("pe") or 0
+        try:
+            pe = float(str(pe).replace(",", "")) if pe else 0
+        except:
+            pe = 0
+        
+        eps = round(cmp / pe, 2) if pe and pe > 0 else 0
+        
+        # Company info
+        company_name = (metadata.get("companyName") or 
+                        q.get("companyName") or 
+                        metadata.get("symbol") or base)
+        sector = (ind_info.get("macro") or 
+                  ind_info.get("sector") or 
+                  metadata.get("industry") or "")
+        industry = (ind_info.get("basicIndustry") or 
+                    ind_info.get("industry") or "")
         
         result = {
             "cmp":          round(cmp, 2),
-            "mcap_cr":      0,
-            "shares_cr":    0,
-            "pe":           0,
-            "eps":          0,
-            "name":         q.get("companyName") or base,
-            "sector":       ind_info.get("macro") or ind_info.get("sector") or "",
-            "industry":     ind_info.get("basicIndustry") or "",
-            "change":       change,
-            "changePct":    change_pct,
-            "yearHigh":     wk.get("max") or wk.get("maxDate") or 0,
-            "yearLow":      wk.get("min") or wk.get("minDate") or 0,
+            "mcap_cr":      round(mcap / 1e7, 2) if mcap else 0,
+            "shares_cr":    round(issued_size / 1e7, 2) if issued_size else 0,
+            "pe":           round(pe, 2),
+            "eps":          eps,
+            "name":         company_name,
+            "sector":       sector,
+            "industry":     industry,
+            "change":       round(change, 2) if isinstance(change, float) else change,
+            "changePct":    round(change_pct, 2) if isinstance(change_pct, float) else change_pct,
+            "yearHigh":     year_high,
+            "yearLow":      year_low,
             "bookValue":    0,
             "dividendYield": 0,
             "currency":     "INR",
@@ -2228,7 +2302,7 @@ def _nsetools_quote(symbol):
             "_ticker":      base + ".NS",
         }
         
-        log.info(f"[NSETOOLS] ✅ {base}: ₹{cmp}")
+        log.info(f"[NSETOOLS] ✅ {base}: ₹{cmp} | mcap={result['mcap_cr']}Cr | pe={pe}")
         return result
         
     except ImportError:
@@ -2708,6 +2782,56 @@ def batch_quotes():
 
 
 # ═══════ HEALTH & TEST ═══════
+
+@app.route("/api/debug-quote/<symbol>")
+def debug_quote(symbol):
+    """Debug: show what each source returns for a symbol. Admin only in production."""
+    sym = symbol.upper().replace(".NS", "").replace(".BO", "")
+    result = {"symbol": sym, "sources": {}}
+    
+    # Test nsetools raw response
+    try:
+        from nsetools import Nse
+        nse = Nse()
+        raw = nse.get_quote(sym, all_data=True)
+        if raw:
+            # Show key fields (not full dump which is huge)
+            result["sources"]["nsetools_raw_keys"] = list(raw.keys()) if isinstance(raw, dict) else "not_dict"
+            if isinstance(raw, dict):
+                for key in ["priceInfo", "securityInfo", "metadata", "industryInfo", "info"]:
+                    sub = raw.get(key)
+                    if sub and isinstance(sub, dict):
+                        result["sources"][f"nsetools_{key}"] = {k: v for k, v in sub.items() if v is not None and v != "" and v != 0}
+                # Also show flat-level price fields
+                for key in ["lastPrice", "previousClose", "change", "pChange", "companyName", "pe"]:
+                    if key in raw:
+                        result["sources"][f"nsetools_flat_{key}"] = raw[key]
+    except Exception as e:
+        result["sources"]["nsetools_error"] = str(e)[:200]
+    
+    # Test NSE direct
+    try:
+        direct = _nse_direct_quote(sym)
+        if direct:
+            result["sources"]["nse_direct"] = {k: v for k, v in direct.items() if v}
+        else:
+            result["sources"]["nse_direct"] = "failed"
+    except Exception as e:
+        result["sources"]["nse_direct_error"] = str(e)[:200]
+    
+    # Enrichment cache status
+    eck = f"enrich:{sym}"
+    enrichment = cached(eck, 21600)
+    result["sources"]["enrichment_cached"] = bool(enrichment)
+    if enrichment:
+        result["sources"]["enrichment_data"] = enrichment
+    
+    # Quote cache status
+    ck = f"f:{sym}"
+    fullstock_cache = cached(ck, QUOTE_TTL)
+    result["sources"]["fullstock_cached"] = bool(fullstock_cache)
+    
+    return jsonify(result)
 
 @app.route("/")
 def health():
