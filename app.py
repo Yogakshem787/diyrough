@@ -9,7 +9,8 @@ DIY Investing — Full Stack Backend v7
 - Grok API for sentiment analysis
 """
 
-import os, time, math, logging, hashlib, secrets, json
+import os, time, math, logging, hashlib, secrets, json, re
+import hmac as hmac_mod
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -22,6 +23,26 @@ from flask_sqlalchemy import SQLAlchemy
 import jwt as pyjwt
 import requests
 import yfinance as yf
+
+# ═══════ RATE LIMITER ═══════
+# Simple in-memory rate limiter (no extra dependency needed)
+_rate_limits = {}  # key -> list of timestamps
+
+def rate_limit_check(key, max_requests, window_seconds):
+    """Return True if request is allowed, False if rate limited."""
+    now = time.time()
+    if key not in _rate_limits:
+        _rate_limits[key] = []
+    # Remove expired entries
+    _rate_limits[key] = [t for t in _rate_limits[key] if now - t < window_seconds]
+    if len(_rate_limits[key]) >= max_requests:
+        return False
+    _rate_limits[key].append(now)
+    return True
+
+def get_client_ip():
+    """Get real client IP, considering proxies."""
+    return request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
 
 # ═══════ CONFIG ═══════
 app = Flask(__name__)
@@ -66,6 +87,9 @@ def add_cors_headers(response):
         response.headers["Access-Control-Allow-Headers"]     = "Content-Type, Authorization"
         response.headers["Access-Control-Allow-Methods"]     = "GET, POST, PUT, DELETE, OPTIONS"
         response.headers["Vary"]                             = "Origin"
+    # Fix Google Sign-In COOP error: allow popup to postMessage back
+    response.headers["Cross-Origin-Opener-Policy"]    = "same-origin-allow-popups"
+    response.headers["Cross-Origin-Embedder-Policy"]  = "unsafe-none"
     return response
 
 @app.route("/api/<path:path>", methods=["OPTIONS"])
@@ -80,6 +104,19 @@ def handle_options(path):
         response.headers["Access-Control-Allow-Methods"]     = "GET, POST, PUT, DELETE, OPTIONS"
         response.headers["Access-Control-Max-Age"]           = "3600"
     return response
+
+
+@app.before_request
+def csrf_origin_check():
+    """Block state-changing requests from unknown origins (CSRF protection)."""
+    if request.method in ("POST", "PUT", "DELETE"):
+        origin = request.headers.get("Origin", "")
+        # Allow requests with no Origin header (server-to-server, e.g. webhooks)
+        if origin and origin not in ALLOWED_ORIGINS:
+            # Exception: Razorpay webhooks come from Razorpay servers (no Origin)
+            if "/api/payment/webhook" not in request.path:
+                log.warning(f"[CSRF] Blocked request from origin: {origin} to {request.path}")
+                return jsonify({"error": "Origin not allowed"}), 403
 
 PORT = int(os.environ.get("PORT", 10000))
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -103,6 +140,125 @@ RAZORPAY_YEARLY_LINK = os.environ.get("RAZORPAY_YEARLY_LINK", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("diy")
+
+
+# ═══════ EMAIL HELPERS ═══════
+
+def send_email(to_email, subject, html_body):
+    """Send email via SMTP. Fails silently if SMTP not configured."""
+    if not SMTP_USER or not SMTP_PASS:
+        log.warning("[EMAIL] SMTP not configured — skipping email")
+        return False
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{FROM_NAME} <{SMTP_USER}>"
+        msg["To"] = to_email
+        msg.attach(MIMEText(html_body, "html"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, to_email, msg.as_string())
+        log.info(f"[EMAIL] Sent to {to_email}: {subject}")
+        return True
+    except Exception as e:
+        log.error(f"[EMAIL ERROR] {to_email}: {e}")
+        return False
+
+
+def welcome_email(user):
+    """Send welcome email to new users."""
+    send_email(
+        user.email,
+        "Welcome to DIY Investing! 🎉",
+        f"""
+        <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px">
+            <div style="background:linear-gradient(135deg,#0c1220,#1e293b);border-radius:12px;padding:28px;text-align:center;margin-bottom:20px">
+                <div style="background:linear-gradient(135deg,#f59e0b,#ea580c);display:inline-block;width:48px;height:48px;border-radius:12px;line-height:48px;font-weight:900;color:#0c1220;font-size:16px;margin-bottom:12px">DI</div>
+                <h1 style="color:#f1f5f9;font-size:22px;margin:0 0 4px">Welcome, {user.name or 'Investor'}!</h1>
+                <p style="color:#94a3b8;font-size:13px;margin:0">Your 2-day free trial is now active</p>
+            </div>
+            <h2 style="font-size:16px;color:#0f172a;margin-bottom:12px">Here's what you can do:</h2>
+            <ul style="color:#334155;font-size:13px;line-height:2">
+                <li>🔄 <b>Reverse DCF</b> — Find implied growth for any Indian stock</li>
+                <li>📊 <b>Curated Screens</b> — Bluechip, Midcap, Smallcap screens</li>
+                <li>🤖 <b>AI Sentiment</b> — Real-time sentiment analysis</li>
+                <li>💼 <b>Portfolio Tracker</b> — Import holdings & track DCF</li>
+                <li>📋 <b>Watchlist</b> — Save & monitor your picks</li>
+            </ul>
+            <div style="text-align:center;margin:24px 0">
+                <a href="{FRONTEND_URL}" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Start Analyzing Stocks →</a>
+            </div>
+            <p style="color:#94a3b8;font-size:11px;text-align:center;margin-top:24px;border-top:1px solid #e5e7eb;padding-top:16px">
+                DIY Investing · Not financial advice · Always DYOR<br/>
+                <a href="{FRONTEND_URL}" style="color:#f59e0b">{FRONTEND_URL}</a>
+            </p>
+        </div>
+        """
+    )
+
+
+def subscription_email(user, plan, amount):
+    """Send payment confirmation email."""
+    plan_labels = {"monthly": "Monthly", "quarterly": "Quarterly (3 months)", "yearly": "Annual"}
+    plan_label = plan_labels.get(plan, plan.title())
+    expires_str = user.plan_expires.strftime("%d %B %Y") if user.plan_expires else "N/A"
+    send_email(
+        user.email,
+        f"Payment Confirmed — {plan_label} Plan ✅",
+        f"""
+        <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px">
+            <div style="background:linear-gradient(135deg,#059669,#047857);border-radius:12px;padding:28px;text-align:center;margin-bottom:20px">
+                <div style="font-size:40px;margin-bottom:8px">✅</div>
+                <h1 style="color:#fff;font-size:22px;margin:0 0 4px">Payment Successful!</h1>
+                <p style="color:#d1fae5;font-size:13px;margin:0">Thank you, {user.name or 'Investor'}!</p>
+            </div>
+            <div style="background:#f8fafc;border-radius:10px;padding:20px;margin-bottom:16px">
+                <table style="width:100%;font-size:13px;color:#334155">
+                    <tr><td style="padding:6px 0;color:#64748b">Plan</td><td style="padding:6px 0;text-align:right;font-weight:700">{plan_label}</td></tr>
+                    <tr><td style="padding:6px 0;color:#64748b">Amount</td><td style="padding:6px 0;text-align:right;font-weight:700">₹{amount:.0f}</td></tr>
+                    <tr><td style="padding:6px 0;color:#64748b">Valid Until</td><td style="padding:6px 0;text-align:right;font-weight:700">{expires_str}</td></tr>
+                </table>
+            </div>
+            <p style="font-size:13px;color:#334155;line-height:1.6">
+                All Pro features are now unlocked. Enjoy curated screens, AI sentiment analysis, unlimited watchlist, portfolio tracking, and proprietary research.
+            </p>
+            <div style="text-align:center;margin:24px 0">
+                <a href="{FRONTEND_URL}" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Go to Dashboard →</a>
+            </div>
+            <p style="color:#94a3b8;font-size:11px;text-align:center;margin-top:24px;border-top:1px solid #e5e7eb;padding-top:16px">
+                DIY Investing · Secure payments via Razorpay<br/>
+                Questions? Reply to this email.
+            </p>
+        </div>
+        """
+    )
+
+
+def renewal_reminder_email(user):
+    """Send reminder 3 days before subscription expires."""
+    expires_str = user.plan_expires.strftime("%d %B %Y") if user.plan_expires else "N/A"
+    days_left = user.days_left()
+    send_email(
+        user.email,
+        f"Your Pro plan expires in {days_left} day{'s' if days_left != 1 else ''} ⏰",
+        f"""
+        <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px">
+            <div style="background:linear-gradient(135deg,#f59e0b,#ea580c);border-radius:12px;padding:28px;text-align:center;margin-bottom:20px">
+                <div style="font-size:40px;margin-bottom:8px">⏰</div>
+                <h1 style="color:#fff;font-size:22px;margin:0 0 4px">Subscription Expiring Soon</h1>
+                <p style="color:#fef3c7;font-size:13px;margin:0">Your Pro access expires on {expires_str}</p>
+            </div>
+            <p style="font-size:13px;color:#334155;line-height:1.6">
+                Hi {user.name or 'there'}, your DIY Investing Pro plan expires in <b>{days_left} day{'s' if days_left != 1 else ''}</b>.
+                Renew now to keep uninterrupted access to all features.
+            </p>
+            <div style="text-align:center;margin:24px 0">
+                <a href="{FRONTEND_URL}?tab=pricing" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Renew Now →</a>
+            </div>
+        </div>
+        """
+    )
 
 
 # ═══════ DATABASE MODELS ═══════
@@ -305,6 +461,15 @@ class PropResearch(db.Model):
         }
 
 
+class StockCache(db.Model):
+    """Persistent stock data cache that survives restarts."""
+    __tablename__ = "stock_cache"
+    key = db.Column(db.String(200), primary_key=True)
+    data = db.Column(db.Text, default="")  # JSON
+    expires_at = db.Column(db.DateTime, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 # ═══════ AUTH HELPERS ═══════
 
 def hash_password(pwd):
@@ -324,7 +489,7 @@ def make_token(user):
         "uid": user.id,
         "email": user.email,
         "admin": user.is_admin,
-        "exp": datetime.utcnow() + timedelta(days=30),
+        "exp": datetime.utcnow() + timedelta(days=7),
     }
     return pyjwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
 
@@ -355,9 +520,23 @@ def auth_required(f):
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not g.user:
-            log.warning(f"[ADMIN] No user in context for {request.path}")
+        # First do auth check (same as auth_required)
+        token = None
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+        if not token:
             return jsonify({"error": "Login required"}), 401
+        try:
+            data = pyjwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+            g.user = User.query.get(data["uid"])
+            if not g.user:
+                return jsonify({"error": "User not found"}), 401
+        except pyjwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except Exception as e:
+            return jsonify({"error": "Invalid token"}), 401
+        # Then check admin
         if not g.user.is_admin:
             log.warning(f"[ADMIN] Non-admin tried {request.path}: {g.user.email}")
             return jsonify({"error": "Admin access required"}), 403
@@ -365,29 +544,88 @@ def admin_required(f):
     return decorated
 
 
-# ═══════ CACHE ═══════
+# ═══════ CACHE (Hybrid: in-memory + DB persistent) ═══════
 cache = {}
 SEARCH_TTL = 7200    # search results: 2 hours
-QUOTE_TTL  = 900     # live quotes: 15 min (was 5 min)
+QUOTE_TTL  = 1800    # live quotes: 30 min (increased from 15 min to reduce rate limits)
 FIN_TTL    = 86400   # financials: 24 hours
 ERROR_TTL  = 120     # cache errors for 2 min to avoid hammering on failures
+STALE_TTL  = 7200    # stale fallback data: 2 hours
+
+def get_dynamic_quote_ttl():
+    """Longer TTL off-market-hours to reduce yfinance calls."""
+    try:
+        from datetime import timezone
+        ist = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(ist)
+        # Weekend
+        if now.weekday() >= 5:
+            return 14400  # 4 hours
+        # Market hours (9:15 AM - 3:30 PM IST)
+        if 9 <= now.hour <= 15:
+            return 1800   # 30 min during market
+        return 7200  # 2 hours off-market
+    except:
+        return QUOTE_TTL
 
 def cached(key, ttl):
+    """Check in-memory cache first, then DB cache."""
+    # Memory cache (fastest)
     if key in cache:
         val, exp = cache[key]
         if time.time() < exp:
             return val
         del cache[key]
+    # DB cache (survives restarts)
+    try:
+        entry = StockCache.query.get(key)
+        if entry and entry.expires_at > datetime.utcnow():
+            val = json.loads(entry.data)
+            # Promote to memory cache
+            cache[key] = (val, entry.expires_at.timestamp())
+            return val
+        # Clean up expired entry
+        if entry:
+            db.session.delete(entry)
+            db.session.commit()
+    except Exception as e:
+        log.debug(f"[CACHE DB] Read error for {key}: {e}")
     return None
 
 def set_cache(key, val, ttl=None):
-    cache[key] = (val, time.time() + (ttl or QUOTE_TTL))
+    """Write to both memory and DB cache."""
+    effective_ttl = ttl or get_dynamic_quote_ttl()
+    expires = time.time() + effective_ttl
+    cache[key] = (val, expires)
+    # Also persist to DB for crash recovery
+    try:
+        entry = StockCache.query.get(key)
+        data_json = json.dumps(val)
+        expires_dt = datetime.utcnow() + timedelta(seconds=effective_ttl)
+        if entry:
+            entry.data = data_json
+            entry.expires_at = expires_dt
+        else:
+            entry = StockCache(key=key, data=data_json, expires_at=expires_dt)
+            db.session.add(entry)
+        db.session.commit()
+    except Exception as e:
+        log.debug(f"[CACHE DB] Write error for {key}: {e}")
+        try:
+            db.session.rollback()
+        except:
+            pass
 
 
 # ═══════ AUTH ROUTES ═══════
 
 @app.route("/api/auth/signup", methods=["POST"])
 def signup():
+    # Rate limit: 5 signups per IP per 10 minutes
+    ip = get_client_ip()
+    if not rate_limit_check(f"signup:{ip}", 5, 600):
+        return jsonify({"error": "Too many signup attempts. Please try again in a few minutes."}), 429
+
     data = request.json or {}
     email = data.get("email", "").strip().lower()
     password = data.get("password", "").strip()
@@ -426,6 +664,11 @@ def signup():
 
 @app.route("/api/auth/login", methods=["POST"])
 def login():
+    # Rate limit: 10 login attempts per IP per 5 minutes
+    ip = get_client_ip()
+    if not rate_limit_check(f"login:{ip}", 10, 300):
+        return jsonify({"error": "Too many login attempts. Please wait a few minutes."}), 429
+
     data = request.json or {}
     email = data.get("email", "").strip().lower()
     password = data.get("password", "").strip()
@@ -446,6 +689,11 @@ def login():
 
 @app.route("/api/auth/google", methods=["POST"])
 def google_auth():
+    # Rate limit: 10 Google auth attempts per IP per 5 minutes
+    ip = get_client_ip()
+    if not rate_limit_check(f"gauth:{ip}", 10, 300):
+        return jsonify({"error": "Too many attempts. Please wait a few minutes."}), 429
+
     data = request.json or {}
     credential = data.get("credential")
     if not credential:
@@ -551,14 +799,98 @@ def auth_me():
     return jsonify({"user": g.user.to_dict()})
 
 
+# ═══════ PASSWORD RESET ═══════
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+def forgot_password():
+    """Send a password reset link via email."""
+    ip = get_client_ip()
+    if not rate_limit_check(f"forgot:{ip}", 3, 600):
+        return jsonify({"error": "Too many reset requests. Please wait 10 minutes."}), 429
+    
+    data = request.json or {}
+    email = data.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+    
+    u = User.query.filter_by(email=email).first()
+    if u:
+        # Generate time-limited reset token (1 hour expiry)
+        reset_payload = {
+            "uid": u.id,
+            "purpose": "reset",
+            "exp": datetime.utcnow() + timedelta(hours=1),
+        }
+        reset_token = pyjwt.encode(reset_payload, app.config["SECRET_KEY"], algorithm="HS256")
+        reset_url = f"{FRONTEND_URL}?reset_token={reset_token}"
+        
+        send_email(
+            u.email,
+            "Reset Your Password — DIY Investing",
+            f"""
+            <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px">
+                <h2 style="color:#0f172a">Password Reset</h2>
+                <p style="color:#334155;font-size:14px">Hi {u.name or 'there'},</p>
+                <p style="color:#334155;font-size:14px">Click the button below to reset your password. This link expires in 1 hour.</p>
+                <div style="text-align:center;margin:24px 0">
+                    <a href="{reset_url}" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Reset Password →</a>
+                </div>
+                <p style="color:#94a3b8;font-size:11px">If you didn't request this, you can safely ignore this email.</p>
+            </div>
+            """
+        )
+        log.info(f"[FORGOT] Reset email sent to {email}")
+    
+    # Always return success to prevent email enumeration
+    return jsonify({"message": "If an account exists with that email, a reset link has been sent."})
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+def reset_password():
+    """Reset password using a valid reset token."""
+    data = request.json or {}
+    token = data.get("token", "")
+    new_password = data.get("password", "").strip()
+    
+    if not token or not new_password:
+        return jsonify({"error": "Token and new password required"}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    
+    try:
+        payload = pyjwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+        if payload.get("purpose") != "reset":
+            return jsonify({"error": "Invalid reset token"}), 400
+        u = User.query.get(payload["uid"])
+        if not u:
+            return jsonify({"error": "User not found"}), 404
+        u.password_hash = hash_password(new_password)
+        db.session.commit()
+        log.info(f"[RESET] Password reset for {u.email}")
+        return jsonify({"message": "Password reset successfully. You can now login."})
+    except pyjwt.ExpiredSignatureError:
+        return jsonify({"error": "Reset link has expired. Please request a new one."}), 400
+    except Exception as e:
+        log.error(f"[RESET ERROR] {e}")
+        return jsonify({"error": "Invalid or expired reset token"}), 400
+
+
 @app.route("/api/auth/profile", methods=["PUT"])
 @auth_required
 def update_profile():
     data = request.json or {}
     g.user.name = data.get("name", g.user.name).strip()
     g.user.phone = data.get("phone", g.user.phone).strip()
+
+    # Email change requires current password verification (security)
     new_email = data.get("email", "").strip().lower()
     if new_email and new_email != g.user.email:
+        current_pwd = data.get("currentPassword", "").strip()
+        # Google-only users can change email without password
+        if g.user.password_hash and not current_pwd:
+            return jsonify({"error": "Current password required to change email"}), 400
+        if g.user.password_hash and not verify_password(current_pwd, g.user.password_hash):
+            return jsonify({"error": "Current password is incorrect"}), 400
         existing = User.query.filter_by(email=new_email).first()
         if existing:
             return jsonify({"error": "Email already in use"}), 400
@@ -571,7 +903,11 @@ def update_profile():
         g.user.password_hash = hash_password(new_pwd)
 
     db.session.commit()
-    return jsonify({"user": g.user.to_dict()})
+    # Return a fresh token if email changed (old token has old email)
+    result = {"user": g.user.to_dict()}
+    if new_email and new_email != data.get("_original_email", ""):
+        result["token"] = make_token(g.user)
+    return jsonify(result)
 
 
 # ═══════ PAYMENT ROUTES (DIRECT LINKS) ═══════
@@ -600,16 +936,16 @@ def payment_webhook():
     try:
         # Verify Razorpay signature if secret is configured
         if RAZORPAY_WEBHOOK_SECRET:
-            import hmac, hashlib as hl
             sig = request.headers.get("X-Razorpay-Signature", "")
             body = request.get_data()
-            expected = hmac.new(
+            expected = hmac_mod.new(
                 RAZORPAY_WEBHOOK_SECRET.encode(),
                 body,
-                hl.sha256
+                hashlib.sha256
             ).hexdigest()
-            if sig and sig != expected:
-                log.error("[WEBHOOK] Signature mismatch - possible fake webhook")
+            # SECURITY: Reject if signature is missing OR doesn't match
+            if not sig or sig != expected:
+                log.error("[WEBHOOK] Signature mismatch or missing — possible fake webhook")
                 return jsonify({"error": "Invalid signature"}), 400
 
         data  = request.json or {}
@@ -625,16 +961,28 @@ def payment_webhook():
 
             # Extract email — Razorpay stores it in notes or customer details
             notes  = payment_link.get("notes", {}) or {}
+            customer = payment_link.get("customer", {}) or {}
+            payment_notes = payment.get("notes", {}) or {}
+            payment_customer = payment.get("customer", {}) or {}
+            
             email  = (notes.get("email") or 
-                      payment_link.get("customer", {}).get("email") or
-                      payment.get("email") or "").strip().lower()
+                      customer.get("email") or
+                      customer.get("contact") or
+                      payment.get("email") or 
+                      payment_notes.get("email") or
+                      payment_customer.get("email") or
+                      "").strip().lower()
             plan   = (notes.get("plan") or 
+                      payment_notes.get("plan") or
                       payment_link.get("description", "monthly").lower().split()[0] or
                       "monthly")
             amount = payment.get("amount", 0) / 100  # paise to rupees
             pay_id = payment.get("id", "")
 
             log.info(f"[WEBHOOK] Payment: email={email}, plan={plan}, amount=₹{amount}, id={pay_id}")
+            # Log full payload for debugging payment issues
+            log.info(f"[WEBHOOK] Notes: {json.dumps(notes)[:200]}")
+            log.info(f"[WEBHOOK] Customer: {json.dumps(customer)[:200]}")
 
             if not email:
                 log.error("[WEBHOOK] No email in payment - cannot update user")
@@ -774,25 +1122,42 @@ def delete_watchlist(item_id):
 @app.route("/api/portfolio")
 @auth_required
 def get_portfolio():
-    """Get user's portfolio holdings with live DCF analysis."""
+    """Get user's portfolio holdings with live DCF analysis (optimized batch fetch)."""
     holdings = Portfolio.query.filter_by(user_id=g.user.id).order_by(Portfolio.buy_date.desc()).all()
     
-    result = []
-    for h in holdings:
-        # Get live quote for current price
-        quote = yf_quote(h.symbol)
-        if quote:
-            h.current_price = quote.get('cmp', 0)
-            db.session.commit()
-        
-        # Get latest PAT for DCF calculation
-        sym = h.symbol.upper()
+    if not holdings:
+        return jsonify([])
+    
+    # Batch fetch: collect unique symbols, fetch quotes once each
+    unique_symbols = list(set(h.symbol.upper() for h in holdings))
+    quotes = {}
+    financials_map = {}
+    
+    for sym in unique_symbols:
+        # Quote (uses cache, so won't hit yfinance if already cached)
+        q = yf_quote(sym)
+        if q:
+            quotes[sym] = q
+        # Financials
         fck = f"fin:{sym}"
         years = cached(fck, FIN_TTL)
         if years is None:
             years = yf_financials(sym)
             if years:
                 set_cache(fck, years, FIN_TTL)
+        financials_map[sym] = years or []
+    
+    result = []
+    price_updated = False
+    for h in holdings:
+        sym = h.symbol.upper()
+        quote = quotes.get(sym)
+        years = financials_map.get(sym, [])
+        
+        # Update current price from quote
+        if quote:
+            h.current_price = quote.get('cmp', 0)
+            price_updated = True
         
         pat = years[0].get('pat', 0) if years and len(years) > 0 else 0
         
@@ -826,6 +1191,13 @@ def get_portfolio():
             "pat": pat,
             "impliedGrowth": implied_growth,
         })
+    
+    # Single commit for all price updates (instead of per-holding)
+    if price_updated:
+        try:
+            db.session.commit()
+        except:
+            db.session.rollback()
     
     return jsonify(result)
 
@@ -965,8 +1337,8 @@ def upload_portfolio_csv():
                 headers_raw = rows[0]
                 data_rows = rows[1:]
                 
-                # Create DictReader-like structure
-                csv_reader = [dict(zip(headers_raw, row)) for row in data_rows]
+                # Create DictReader-like structure (normalize keys to lowercase)
+                csv_reader = [{(str(k).strip().lower() if k else ""): (str(v).strip() if v else "") for k, v in zip(headers_raw, row)} for row in data_rows]
                 fieldnames = headers_raw
                 
             except ImportError:
@@ -977,8 +1349,9 @@ def upload_portfolio_csv():
             # Parse CSV file
             stream = io.StringIO(file.stream.read().decode("utf-8"), newline=None)
             csv_reader_obj = csv.DictReader(stream)
-            csv_reader = csv_reader_obj
             fieldnames = csv_reader_obj.fieldnames
+            # Normalize all row keys to lowercase for consistent column matching
+            csv_reader = [{(k.strip().lower() if k else ""): (str(v).strip() if v else "") for k, v in row.items()} for row in csv_reader_obj]
         
         # Detect column mappings (different brokers use different headers)
         if file_ext in ["xlsx", "xls"]:
@@ -1045,10 +1418,10 @@ def upload_portfolio_csv():
         rows_to_process = csv_reader if file_ext in ["xlsx", "xls"] else csv_reader
         for i, row in enumerate(rows_to_process, start=2):  # start=2 because row 1 is headers
             try:
-                # Extract data
-                symbol_raw = row.get(symbol_col, "").strip().upper()
-                qty_raw = row.get(qty_col, "").strip()
-                price_raw = row.get(avg_price_col, "").strip()
+                # Extract data (all values are strings after normalization)
+                symbol_raw = (row.get(symbol_col) or "").strip().upper()
+                qty_raw = (row.get(qty_col) or "").strip()
+                price_raw = (row.get(avg_price_col) or "").strip()
                 
                 # Clean symbol (remove .NS, .BO, exchange info)
                 symbol = re.sub(r'\.(NS|BO|BSE|NSE)$', '', symbol_raw)
@@ -1308,6 +1681,43 @@ def admin_payments():
         }
     })
 
+
+@app.route("/api/admin/check-expiry", methods=["POST"])
+@auth_required
+@admin_required
+def admin_check_expiry():
+    """Check for expiring subscriptions and send reminders."""
+    three_days = datetime.utcnow() + timedelta(days=3)
+    expiring = User.query.filter(
+        User.plan_expires <= three_days,
+        User.plan_expires > datetime.utcnow(),
+        User.plan.in_(["monthly", "quarterly", "yearly"]),
+    ).all()
+    
+    sent = 0
+    for u in expiring:
+        try:
+            renewal_reminder_email(u)
+            sent += 1
+        except Exception as e:
+            log.error(f"[EXPIRY EMAIL] {u.email}: {e}")
+    
+    return jsonify({"checked": len(expiring), "reminders_sent": sent})
+
+
+@app.route("/api/admin/cleanup-cache", methods=["POST"])
+@auth_required
+@admin_required
+def admin_cleanup_cache():
+    """Clean up expired DB cache entries."""
+    try:
+        expired = StockCache.query.filter(StockCache.expires_at < datetime.utcnow()).delete()
+        db.session.commit()
+        return jsonify({"deleted": expired})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
 # ═══════ SENTIMENT ANALYSIS (GROK) ═══════
 
 @app.route("/api/sentiment/<symbol>")
@@ -1504,7 +1914,6 @@ Format response as JSON:
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         
         # Try to parse JSON from content
-        import re
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             sentiment_data = json.loads(json_match.group())
@@ -1859,7 +2268,7 @@ def fullstock(symbol):
         except: pass
 
     set_cache(ck, result)
-    set_cache(f"stale:{ck}", result, 3600)  # keep stale copy for 1hr fallback
+    set_cache(f"stale:{ck}", result, STALE_TTL)  # keep stale copy for fallback
     return jsonify(result)
 
 
