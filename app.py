@@ -548,9 +548,13 @@ def admin_required(f):
 cache = {}
 SEARCH_TTL = 7200    # search results: 2 hours
 QUOTE_TTL  = 1800    # live quotes: 30 min (increased from 15 min to reduce rate limits)
-FIN_TTL    = 86400   # financials: 24 hours
+FIN_TTL    = 259200   # financials: 72 hours (revenue/PAT only changes quarterly)
 ERROR_TTL  = 120     # cache errors for 2 min to avoid hammering on failures
 STALE_TTL  = 7200    # stale fallback data: 2 hours
+
+# ── yfinance global throttle (prevents rate limiting) ──
+_yf_last_call = 0
+YF_MIN_INTERVAL = 3.0  # minimum 3 seconds between yfinance calls
 
 def get_dynamic_quote_ttl():
     """Longer TTL off-market-hours to reduce yfinance calls."""
@@ -1145,6 +1149,10 @@ def get_portfolio():
             years = yf_financials(sym)
             if years:
                 set_cache(fck, years, FIN_TTL)
+                set_cache(f"stale_fin:{sym}", years, 604800)
+            else:
+                # Serve stale financials rather than nothing
+                years = cached(f"stale_fin:{sym}", 604800)
         financials_map[sym] = years or []
     
     result = []
@@ -2037,82 +2045,348 @@ def delete_prop_research(research_id):
     return jsonify({"status": "deleted"})
 
 
-# ═══════ YFINANCE HELPERS ═══════
+# ═══════ MULTI-SOURCE STOCK DATA ENGINE ═══════
+# Priority: nsetools (NSE direct, no rate limits) → NSE HTTP API → yfinance (last resort)
+# yfinance is ONLY used for annual financials (revenue/PAT) which are cached 24h+
 
-def yf_quote(symbol):
-    """Fetch live quote with retry + exponential backoff on rate limit."""
-    base = symbol.replace(".NS","").replace(".BO","")
+# ── Global NSE session (reuses cookies, avoids repeated handshakes) ──
+_nse_session = None
+_nse_cookies = None
+_nse_cookie_time = 0
+NSE_COOKIE_TTL = 300  # refresh cookies every 5 min
+
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
+}
+
+
+def _get_nse_session():
+    """Get or refresh an HTTP session with valid NSE cookies."""
+    global _nse_session, _nse_cookies, _nse_cookie_time
+    now = time.time()
+    if _nse_session and _nse_cookies and (now - _nse_cookie_time) < NSE_COOKIE_TTL:
+        return _nse_session
+    
+    try:
+        s = requests.Session()
+        s.headers.update(NSE_HEADERS)
+        # Hit NSE homepage to get cookies
+        r = s.get("https://www.nseindia.com", timeout=10)
+        if r.status_code == 200:
+            _nse_session = s
+            _nse_cookies = s.cookies
+            _nse_cookie_time = now
+            log.info("[NSE] Session cookies refreshed")
+            return s
+    except Exception as e:
+        log.warning(f"[NSE] Cookie refresh failed: {e}")
+    return None
+
+
+def _nse_direct_quote(symbol):
+    """
+    Fetch quote directly from NSE India API.
+    Returns same format as yf_quote for compatibility.
+    No Yahoo dependency = no rate limits from Yahoo.
+    """
+    base = symbol.replace(".NS", "").replace(".BO", "").upper()
+    s = _get_nse_session()
+    if not s:
+        return None
+    
+    try:
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={base}"
+        r = s.get(url, timeout=12)
+        
+        if r.status_code == 403:
+            # Cookie expired mid-session, force refresh
+            global _nse_cookie_time
+            _nse_cookie_time = 0
+            s = _get_nse_session()
+            if s:
+                r = s.get(url, timeout=12)
+        
+        if r.status_code != 200:
+            log.warning(f"[NSE DIRECT] {base} status={r.status_code}")
+            return None
+        
+        data = r.json()
+        pi = data.get("priceInfo", {})
+        info = data.get("info", {}) or data.get("metadata", {}) or {}
+        industry_info = data.get("industryInfo", {}) or {}
+        sec_info = data.get("securityInfo", {}) or {}
+        
+        cmp = pi.get("lastPrice") or pi.get("close") or pi.get("previousClose") or 0
+        if not cmp or cmp <= 0:
+            return None
+        
+        prev_close = pi.get("previousClose") or 0
+        change = round(cmp - prev_close, 2) if prev_close else 0
+        change_pct = round((change / prev_close) * 100, 2) if prev_close else 0
+        
+        # Calculate market cap from issued size or traded info
+        issued_size = sec_info.get("issuedSize") or 0
+        mcap = cmp * issued_size if issued_size else 0
+        shares = issued_size
+        
+        wk_high_low = pi.get("weekHighLow", {}) or {}
+        
+        pe = info.get("pdSymbolPe") or info.get("pe") or 0
+        try:
+            pe = float(pe) if pe else 0
+        except:
+            pe = 0
+        
+        sector = (industry_info.get("macro") or 
+                  industry_info.get("sector") or 
+                  info.get("industry") or "")
+        industry = (industry_info.get("basicIndustry") or 
+                    industry_info.get("industry") or "")
+        
+        result = {
+            "cmp":          round(cmp, 2),
+            "mcap_cr":      round(mcap / 1e7, 2) if mcap else 0,
+            "shares_cr":    round(shares / 1e7, 2) if shares else 0,
+            "pe":           round(pe, 2),
+            "eps":          round(cmp / pe, 2) if pe and pe > 0 else 0,
+            "name":         info.get("companyName") or info.get("symbol") or base,
+            "sector":       sector,
+            "industry":     industry,
+            "change":       change,
+            "changePct":    change_pct,
+            "yearHigh":     wk_high_low.get("max") or 0,
+            "yearLow":      wk_high_low.get("min") or 0,
+            "bookValue":    0,  # not in NSE quote endpoint
+            "dividendYield": 0,  # not in NSE quote endpoint
+            "currency":     "INR",
+            "_source":      "nse_direct",
+            "_ticker":      base + ".NS",
+        }
+        
+        log.info(f"[NSE DIRECT] ✅ {base}: ₹{cmp}")
+        return result
+        
+    except requests.exceptions.Timeout:
+        log.warning(f"[NSE DIRECT] Timeout for {base}")
+        return None
+    except Exception as e:
+        log.warning(f"[NSE DIRECT] {base}: {e}")
+        return None
+
+
+def _nsetools_quote(symbol):
+    """
+    Fetch quote via nsetools library (wraps NSE APIs cleanly).
+    Fallback if direct NSE HTTP fails.
+    """
+    base = symbol.replace(".NS", "").replace(".BO", "").upper()
+    try:
+        from nsetools import Nse
+        nse = Nse()
+        q = nse.get_quote(base, all_data=True)
+        if not q:
+            return None
+        
+        pi = q.get("priceInfo", q)  # v2.0 returns nested structure
+        cmp = (pi.get("lastPrice") or pi.get("close") or 
+               q.get("lastPrice") or q.get("close") or 0)
+        
+        if not cmp or cmp <= 0:
+            return None
+        
+        prev_close = pi.get("previousClose") or q.get("previousClose") or 0
+        change = round(cmp - prev_close, 2) if prev_close else 0
+        change_pct = round((change / prev_close) * 100, 2) if prev_close else 0
+        
+        # Try to get 52-week data
+        wk = pi.get("weekHighLow", {}) or q.get("weekHighLow", {}) or {}
+        
+        ind_info = q.get("industryInfo", {}) or {}
+        
+        result = {
+            "cmp":          round(cmp, 2),
+            "mcap_cr":      0,
+            "shares_cr":    0,
+            "pe":           0,
+            "eps":          0,
+            "name":         q.get("companyName") or base,
+            "sector":       ind_info.get("macro") or ind_info.get("sector") or "",
+            "industry":     ind_info.get("basicIndustry") or "",
+            "change":       change,
+            "changePct":    change_pct,
+            "yearHigh":     wk.get("max") or wk.get("maxDate") or 0,
+            "yearLow":      wk.get("min") or wk.get("minDate") or 0,
+            "bookValue":    0,
+            "dividendYield": 0,
+            "currency":     "INR",
+            "_source":      "nsetools",
+            "_ticker":      base + ".NS",
+        }
+        
+        log.info(f"[NSETOOLS] ✅ {base}: ₹{cmp}")
+        return result
+        
+    except ImportError:
+        log.debug("[NSETOOLS] nsetools not installed")
+        return None
+    except Exception as e:
+        log.warning(f"[NSETOOLS] {base}: {e}")
+        return None
+
+
+def _yf_quote_inner(symbol):
+    """yfinance quote — LAST RESORT only, high rate limit risk from cloud IPs."""
+    base = symbol.replace(".NS", "").replace(".BO", "")
     tickers_to_try = [base + ".NS", base + ".BO"]
     
     for ticker in tickers_to_try:
-        # Check if this ticker is error-cached (rate limited recently)
         err_key = f"err_{ticker}"
         if cached(err_key, ERROR_TTL) is not None:
-            log.debug(f"[YF] Skipping {ticker} — error-cached")
             continue
         
-        for attempt in range(3):  # retry up to 3 times with backoff
-            try:
-                t    = yf.Ticker(ticker)
-                info = t.info
-                
-                if not info or len(info) < 5:
-                    break  # empty response, try next ticker
-                
-                cmp = (info.get("regularMarketPrice") or 
-                       info.get("currentPrice") or 
-                       info.get("previousClose") or 0)
-                if not cmp:
-                    break
-                
-                mcap     = info.get("marketCap", 0)
-                shares   = (mcap / cmp) if cmp > 0 else 0
-                
-                return {
-                    "cmp":          round(cmp, 2),
-                    "mcap_cr":      round(mcap / 1e7, 2),
-                    "shares_cr":    round(shares / 1e7, 2),
-                    "pe":           round(info.get("trailingPE", 0) or 0, 2),
-                    "eps":          round(info.get("trailingEps", 0) or 0, 2),
-                    "name":         info.get("longName") or info.get("shortName") or symbol,
-                    "sector":       info.get("sector") or "",
-                    "industry":     info.get("industry") or "",
-                    "change":       round(info.get("regularMarketChange", 0) or 0, 2),
-                    "changePct":    round(info.get("regularMarketChangePercent", 0) or 0, 2),
-                    "yearHigh":     info.get("fiftyTwoWeekHigh", 0),
-                    "yearLow":      info.get("fiftyTwoWeekLow", 0),
-                    "bookValue":    info.get("bookValue", 0),
-                    "dividendYield":round((info.get("dividendYield", 0) or 0) * 100, 2),
-                    "currency":     info.get("currency", "INR"),
-                    "_ticker":      ticker,
-                }
-                
-            except Exception as e:
-                err_str = str(e).lower()
-                if "too many requests" in err_str or "rate limit" in err_str or "429" in err_str:
-                    log.warning(f"[YF RATE LIMIT] {ticker} attempt {attempt+1}/3")
-                    # Cache the error so we don't hammer Yahoo
-                    set_cache(f"err_{ticker}", True, ERROR_TTL)
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)  # 1s, 2s backoff
-                    break  # don't retry rate limits beyond backoff
-                else:
-                    log.error(f"[YF QUOTE ERROR] {ticker} attempt {attempt+1}: {e}")
-                    if attempt < 2:
-                        time.sleep(0.5)
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info
+            
+            if not info or len(info) < 5:
+                break
+            
+            cmp = (info.get("regularMarketPrice") or
+                   info.get("currentPrice") or
+                   info.get("previousClose") or 0)
+            if not cmp:
+                break
+            
+            mcap = info.get("marketCap", 0)
+            shares = (mcap / cmp) if cmp > 0 else 0
+            
+            result = {
+                "cmp":          round(cmp, 2),
+                "mcap_cr":      round(mcap / 1e7, 2),
+                "shares_cr":    round(shares / 1e7, 2),
+                "pe":           round(info.get("trailingPE", 0) or 0, 2),
+                "eps":          round(info.get("trailingEps", 0) or 0, 2),
+                "name":         info.get("longName") or info.get("shortName") or symbol,
+                "sector":       info.get("sector") or "",
+                "industry":     info.get("industry") or "",
+                "change":       round(info.get("regularMarketChange", 0) or 0, 2),
+                "changePct":    round(info.get("regularMarketChangePercent", 0) or 0, 2),
+                "yearHigh":     info.get("fiftyTwoWeekHigh", 0),
+                "yearLow":      info.get("fiftyTwoWeekLow", 0),
+                "bookValue":    info.get("bookValue", 0),
+                "dividendYield":round((info.get("dividendYield", 0) or 0) * 100, 2),
+                "currency":     info.get("currency", "INR"),
+                "_source":      "yfinance",
+                "_ticker":      ticker,
+            }
+            log.info(f"[YF] ✅ {base}: ₹{cmp}")
+            return result
+            
+        except Exception as e:
+            err_str = str(e).lower()
+            if "too many requests" in err_str or "rate limit" in err_str or "429" in err_str:
+                log.warning(f"[YF RATE LIMIT] {ticker}")
+                set_cache(f"err_{ticker}", True, ERROR_TTL)
+                break
+            else:
+                log.error(f"[YF QUOTE ERROR] {ticker}: {e}")
     
-    log.warning(f"[YF] Could not fetch quote for {symbol}")
+    return None
+
+
+# ── Track which source is working (auto-switch) ──
+_yf_failures = 0  # count consecutive yfinance failures
+YF_FAILURE_THRESHOLD = 3  # after 3 failures, skip yfinance for a while
+_yf_skip_until = 0  # timestamp until which yfinance is skipped
+
+
+def yf_quote(symbol):
+    """
+    Multi-source quote fetcher:
+      1. NSE Direct HTTP API (primary — no rate limits)
+      2. nsetools library (backup)
+      3. yfinance (last resort — rate limited on cloud IPs)
+    
+    Returns standardized dict or None.
+    """
+    global _yf_failures, _yf_skip_until
+    
+    # Source 1: NSE Direct API
+    try:
+        result = _nse_direct_quote(symbol)
+        if result and result.get("cmp", 0) > 0:
+            return result
+    except Exception as e:
+        log.debug(f"[QUOTE] NSE direct failed for {symbol}: {e}")
+    
+    # Source 2: nsetools library
+    try:
+        result = _nsetools_quote(symbol)
+        if result and result.get("cmp", 0) > 0:
+            return result
+    except Exception as e:
+        log.debug(f"[QUOTE] nsetools failed for {symbol}: {e}")
+    
+    # Source 3: yfinance (skip if recently rate-limited)
+    now = time.time()
+    if now < _yf_skip_until:
+        log.debug(f"[QUOTE] Skipping yfinance for {symbol} — cooling down")
+    else:
+        try:
+            result = _yf_quote_inner(symbol)
+            if result and result.get("cmp", 0) > 0:
+                _yf_failures = 0  # reset on success
+                return result
+            else:
+                _yf_failures += 1
+        except Exception as e:
+            _yf_failures += 1
+            log.debug(f"[QUOTE] yfinance failed for {symbol}: {e}")
+        
+        # If yfinance keeps failing, back off
+        if _yf_failures >= YF_FAILURE_THRESHOLD:
+            _yf_skip_until = now + 300  # skip yfinance for 5 min
+            log.warning(f"[QUOTE] yfinance failed {_yf_failures}x — skipping for 5 min")
+            _yf_failures = 0
+    
+    log.warning(f"[QUOTE] All sources failed for {symbol}")
     return None
 
 
 def yf_financials(symbol):
+    """
+    Fetch annual financials (revenue + PAT).
+    yfinance is the ONLY free source for this data.
+    Cached for 72+ hours since annual results change quarterly.
+    Throttled to max 1 yfinance call per 3 seconds globally.
+    """
+    global _yf_last_call
     ticker = symbol if "." in symbol else symbol + ".NS"
+    
+    # Global throttle: wait if we called yfinance too recently
+    now = time.time()
+    elapsed = now - _yf_last_call
+    if elapsed < YF_MIN_INTERVAL:
+        wait = YF_MIN_INTERVAL - elapsed
+        log.debug(f"[YF FIN] Throttling {ticker} — waiting {wait:.1f}s")
+        time.sleep(wait)
+    
+    _yf_last_call = time.time()
+    
     try:
         t = yf.Ticker(ticker)
         inc = t.financials
         if inc is None or inc.empty:
             if not ticker.endswith(".BO"):
                 ticker2 = symbol.replace(".NS", "") + ".BO"
+                # Throttle again for second attempt
+                time.sleep(YF_MIN_INTERVAL)
+                _yf_last_call = time.time()
                 t = yf.Ticker(ticker2)
                 inc = t.financials
                 if inc is None or inc.empty:
@@ -2132,14 +2406,45 @@ def yf_financials(symbol):
                     if val is not None and not (isinstance(val, float) and math.isnan(val)):
                         pat = float(val); break
             years.append({"year": year, "rev": round(rev / 1e7, 2), "pat": round(pat / 1e7, 2)})
+        log.info(f"[YF FIN] ✅ {ticker}: {len(years)} years fetched")
         return years
     except Exception as e:
-        log.error(f"[YF FIN ERROR] {ticker}: {e}")
+        err_str = str(e).lower()
+        if "too many requests" in err_str or "rate limit" in err_str or "429" in err_str:
+            log.warning(f"[YF FIN RATE LIMIT] {ticker} — backing off")
+            set_cache(f"err_{ticker}", True, 300)  # block this ticker for 5 min
+        else:
+            log.error(f"[YF FIN ERROR] {ticker}: {e}")
         return None
 
 
 def yf_search(query):
+    """Search stocks — uses NSE direct first, yfinance as fallback."""
     results = []
+    
+    # Try NSE direct search first
+    try:
+        s = _get_nse_session()
+        if s:
+            url = f"https://www.nseindia.com/api/search/autocomplete?q={query}"
+            r = s.get(url, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                for item in (data.get("symbols") or [])[:10]:
+                    sym = item.get("symbol", "")
+                    if sym:
+                        results.append({
+                            "sym": sym,
+                            "name": item.get("symbol_info") or sym,
+                            "sec": "NSE",
+                        })
+            if results:
+                log.info(f"[SEARCH] NSE direct: {len(results)} results for '{query}'")
+                return results[:15]
+    except Exception as e:
+        log.debug(f"[SEARCH] NSE direct failed: {e}")
+    
+    # Fallback: yfinance search
     try:
         for suffix in [".NS", ".BO"]:
             try:
@@ -2231,7 +2536,14 @@ def fullstock(symbol):
     years = cached(fck, FIN_TTL)
     if years is None:
         years = yf_financials(sym)
-        if years: set_cache(fck, years)
+        if years:
+            set_cache(fck, years, FIN_TTL)
+            set_cache(f"stale_fin:{sym}", years, 604800)  # keep stale financials for 7 days
+        else:
+            # Serve stale financials rather than nothing
+            years = cached(f"stale_fin:{sym}", 604800)
+            if years:
+                log.info(f"[FULLSTOCK] Serving stale financials for {sym}")
     if not years: years = []
 
     cmp = quote["cmp"] if quote else 0
@@ -2254,7 +2566,7 @@ def fullstock(symbol):
         "yearLow": quote["yearLow"] if quote else 0,
         "bookValue": quote["bookValue"] if quote else 0,
         "dividendYield": quote["dividendYield"] if quote else 0,
-        "_source": {"quote": "yfinance" if quote else "none", "financials": "yfinance" if years else "none", "years": len(years)},
+        "_source": {"quote": quote.get("_source", "unknown") if quote else "none", "financials": "yfinance" if years else "none", "years": len(years)},
     }
     # Track if logged in user
     auth = request.headers.get("Authorization", "")
@@ -2290,11 +2602,95 @@ def batch_quotes():
 @app.route("/")
 def health():
     return jsonify({
-        "status": "ok", "service": "DIY Investing API v7",
-        "source": "yfinance (INR native)",
+        "status": "ok", "service": "DIY Investing API v8",
+        "source": "multi-source (NSE direct → nsetools → yfinance)",
         "features": ["auth", "google_oauth", "razorpay_links", "watchlist", "sentiment", "prop_research", "admin"],
         "db": "connected" if db.engine else "error",
     })
+
+
+@app.route("/api/data-status")
+def data_status():
+    """Diagnostic: test all data sources individually."""
+    status = {"timestamp": datetime.utcnow().isoformat(), "sources": {}}
+    test_sym = "RELIANCE"
+    
+    # Test 1: NSE Direct
+    try:
+        t0 = time.time()
+        r = _nse_direct_quote(test_sym)
+        ms = round((time.time() - t0) * 1000)
+        status["sources"]["nse_direct"] = {
+            "working": bool(r and r.get("cmp", 0) > 0),
+            "cmp": r.get("cmp") if r else 0,
+            "latency_ms": ms,
+        }
+    except Exception as e:
+        status["sources"]["nse_direct"] = {"working": False, "error": str(e)[:100]}
+    
+    # Test 2: nsetools
+    try:
+        t0 = time.time()
+        r = _nsetools_quote(test_sym)
+        ms = round((time.time() - t0) * 1000)
+        status["sources"]["nsetools"] = {
+            "working": bool(r and r.get("cmp", 0) > 0),
+            "cmp": r.get("cmp") if r else 0,
+            "latency_ms": ms,
+        }
+    except Exception as e:
+        status["sources"]["nsetools"] = {"working": False, "error": str(e)[:100]}
+    
+    # Test 3: yfinance (quote)
+    try:
+        t0 = time.time()
+        r = _yf_quote_inner(test_sym)
+        ms = round((time.time() - t0) * 1000)
+        status["sources"]["yfinance_quote"] = {
+            "working": bool(r and r.get("cmp", 0) > 0),
+            "cmp": r.get("cmp") if r else 0,
+            "latency_ms": ms,
+        }
+    except Exception as e:
+        status["sources"]["yfinance_quote"] = {"working": False, "error": str(e)[:100]}
+    
+    # Test 4: yfinance (financials)
+    try:
+        t0 = time.time()
+        fin_cache = cached(f"fin:{test_sym}", FIN_TTL)
+        if fin_cache:
+            status["sources"]["yfinance_financials"] = {
+                "working": True,
+                "years": len(fin_cache),
+                "cached": True,
+                "note": "Serving from cache (72h TTL)",
+            }
+        else:
+            years = yf_financials(test_sym)
+            ms = round((time.time() - t0) * 1000)
+            status["sources"]["yfinance_financials"] = {
+                "working": bool(years),
+                "years": len(years) if years else 0,
+                "cached": False,
+                "latency_ms": ms,
+            }
+    except Exception as e:
+        status["sources"]["yfinance_financials"] = {"working": False, "error": str(e)[:100]}
+    
+    # Cache stats
+    status["cache"] = {
+        "memory_keys": len(cache),
+        "yf_failures": _yf_failures,
+        "yf_skip_until": _yf_skip_until,
+        "yf_skipping": time.time() < _yf_skip_until,
+    }
+    try:
+        db_cache_count = StockCache.query.count()
+        status["cache"]["db_keys"] = db_cache_count
+    except:
+        status["cache"]["db_keys"] = "error"
+    
+    return jsonify(status)
 
 
 @app.route("/api/test")
@@ -2302,7 +2698,11 @@ def test_api():
     result = {"status": "ok", "tests": {}}
     try:
         q = yf_quote("TCS")
-        result["tests"]["quote"] = {"working": bool(q and q["cmp"] > 0), "tcs_cmp": q["cmp"] if q else 0}
+        result["tests"]["quote"] = {
+            "working": bool(q and q["cmp"] > 0),
+            "tcs_cmp": q["cmp"] if q else 0,
+            "source": q.get("_source", "unknown") if q else "failed",
+        }
     except Exception as e:
         result["tests"]["quote"] = {"working": False, "error": str(e)}
     try:
