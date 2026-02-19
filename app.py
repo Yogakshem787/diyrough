@@ -2305,22 +2305,132 @@ YF_FAILURE_THRESHOLD = 3  # after 3 failures, skip yfinance for a while
 _yf_skip_until = 0  # timestamp until which yfinance is skipped
 
 
+def _enrich_with_yfinance(result, symbol):
+    """
+    If NSE quote is missing mcap/PE/EPS, fill from yfinance enrichment cache.
+    Enrichment data (mcap, PE, sector, bookValue etc.) changes slowly,
+    so we cache it for 6 hours separately from live price.
+    """
+    ENRICH_TTL = 21600  # 6 hours
+    base = symbol.replace(".NS", "").replace(".BO", "").upper()
+    eck = f"enrich:{base}"
+    
+    enrichment = cached(eck, ENRICH_TTL)
+    if enrichment is None:
+        # Try to fetch from yfinance (throttled)
+        global _yf_last_call, _yf_failures, _yf_skip_until
+        now = time.time()
+        
+        # Skip if yfinance is in cooldown
+        if now < _yf_skip_until:
+            log.debug(f"[ENRICH] Skipping yfinance for {base} — cooling down")
+            return result
+        
+        # Throttle
+        elapsed = now - _yf_last_call
+        if elapsed < YF_MIN_INTERVAL:
+            time.sleep(YF_MIN_INTERVAL - elapsed)
+        _yf_last_call = time.time()
+        
+        for suffix in [".NS", ".BO"]:
+            try:
+                t = yf.Ticker(base + suffix)
+                info = t.info
+                if info and len(info) > 5 and (info.get("marketCap") or info.get("trailingPE")):
+                    enrichment = {
+                        "mcap":         info.get("marketCap", 0) or 0,
+                        "pe":           info.get("trailingPE", 0) or 0,
+                        "eps":          info.get("trailingEps", 0) or 0,
+                        "shares":       info.get("sharesOutstanding", 0) or 0,
+                        "bookValue":    info.get("bookValue", 0) or 0,
+                        "dividendYield":info.get("dividendYield", 0) or 0,
+                        "name":         info.get("longName") or info.get("shortName") or "",
+                        "sector":       info.get("sector") or "",
+                        "industry":     info.get("industry") or "",
+                        "yearHigh":     info.get("fiftyTwoWeekHigh", 0) or 0,
+                        "yearLow":      info.get("fiftyTwoWeekLow", 0) or 0,
+                    }
+                    set_cache(eck, enrichment, ENRICH_TTL)
+                    # Also keep a stale copy for 7 days
+                    set_cache(f"stale_enrich:{base}", enrichment, 604800)
+                    _yf_failures = 0
+                    log.info(f"[ENRICH] ✅ {base}: mcap={enrichment['mcap']}, pe={enrichment['pe']}")
+                    break
+            except Exception as e:
+                err_str = str(e).lower()
+                if "too many requests" in err_str or "rate limit" in err_str or "429" in err_str:
+                    log.warning(f"[ENRICH RATE LIMIT] {base}")
+                    set_cache(f"err_{base}.NS", True, ERROR_TTL)
+                    _yf_failures += 1
+                    if _yf_failures >= YF_FAILURE_THRESHOLD:
+                        _yf_skip_until = time.time() + 300
+                        log.warning(f"[ENRICH] yfinance failed {_yf_failures}x — skipping for 5 min")
+                        _yf_failures = 0
+                    break
+                else:
+                    log.debug(f"[ENRICH] {base}{suffix}: {e}")
+        
+        # If still no enrichment, try stale
+        if enrichment is None:
+            enrichment = cached(f"stale_enrich:{base}", 604800)
+            if enrichment:
+                log.info(f"[ENRICH] Serving stale enrichment for {base}")
+    
+    # Apply enrichment to the NSE result
+    if enrichment:
+        cmp = result.get("cmp", 0)
+        mcap = enrichment.get("mcap", 0)
+        shares = enrichment.get("shares", 0)
+        
+        if mcap and (not result.get("mcap_cr") or result["mcap_cr"] == 0):
+            result["mcap_cr"] = round(mcap / 1e7, 2)
+        if shares and (not result.get("shares_cr") or result["shares_cr"] == 0):
+            result["shares_cr"] = round(shares / 1e7, 2)
+        if not result.get("pe") or result["pe"] == 0:
+            result["pe"] = round(enrichment.get("pe", 0), 2)
+        if not result.get("eps") or result["eps"] == 0:
+            result["eps"] = round(enrichment.get("eps", 0), 2)
+        if not result.get("bookValue") or result["bookValue"] == 0:
+            result["bookValue"] = enrichment.get("bookValue", 0)
+        if not result.get("dividendYield") or result["dividendYield"] == 0:
+            dy = enrichment.get("dividendYield", 0)
+            result["dividendYield"] = round(dy * 100, 2) if dy and dy < 1 else round(dy, 2)
+        if not result.get("sector"):
+            result["sector"] = enrichment.get("sector", "")
+        if not result.get("industry"):
+            result["industry"] = enrichment.get("industry", "")
+        if not result.get("name") or result["name"] == symbol.upper():
+            name = enrichment.get("name", "")
+            if name:
+                result["name"] = name
+        if enrichment.get("yearHigh") and (not result.get("yearHigh") or result["yearHigh"] == 0):
+            result["yearHigh"] = enrichment["yearHigh"]
+        if enrichment.get("yearLow") and (not result.get("yearLow") or result["yearLow"] == 0):
+            result["yearLow"] = enrichment["yearLow"]
+        
+        result["_enriched"] = True
+    
+    return result
+
+
 def yf_quote(symbol):
     """
     Multi-source quote fetcher:
-      1. NSE Direct HTTP API (primary — no rate limits)
+      1. NSE Direct HTTP API (primary — no rate limits) 
       2. nsetools library (backup)
       3. yfinance (last resort — rate limited on cloud IPs)
     
-    Returns standardized dict or None.
+    After getting a price from any source, enriches with mcap/PE/EPS
+    from yfinance (cached 6 hours — these don't change every second).
     """
     global _yf_failures, _yf_skip_until
+    result = None
     
     # Source 1: NSE Direct API
     try:
         result = _nse_direct_quote(symbol)
         if result and result.get("cmp", 0) > 0:
-            return result
+            return _enrich_with_yfinance(result, symbol)
     except Exception as e:
         log.debug(f"[QUOTE] NSE direct failed for {symbol}: {e}")
     
@@ -2328,7 +2438,7 @@ def yf_quote(symbol):
     try:
         result = _nsetools_quote(symbol)
         if result and result.get("cmp", 0) > 0:
-            return result
+            return _enrich_with_yfinance(result, symbol)
     except Exception as e:
         log.debug(f"[QUOTE] nsetools failed for {symbol}: {e}")
     
@@ -2341,7 +2451,7 @@ def yf_quote(symbol):
             result = _yf_quote_inner(symbol)
             if result and result.get("cmp", 0) > 0:
                 _yf_failures = 0  # reset on success
-                return result
+                return result  # yfinance already has all fields, no enrichment needed
             else:
                 _yf_failures += 1
         except Exception as e:
