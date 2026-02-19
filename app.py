@@ -460,7 +460,11 @@ def google_auth():
             try:
                 r = requests.get(
                     f"https://oauth2.googleapis.com/tokeninfo?id_token={credential}",
-                    timeout=10
+                    timeout=15,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept': 'application/json'
+                    }
                 )
                 if r.status_code == 200:
                     info = r.json()
@@ -469,7 +473,11 @@ def google_auth():
                     # Try alternative endpoint
                     r2 = requests.get(
                         f"https://www.googleapis.com/oauth2/v3/tokeninfo?id_token={credential}",
-                        timeout=10
+                        timeout=15,
+                        headers={
+                            'User-Agent': 'Mozilla/5.0',
+                            'Accept': 'application/json'
+                        }
                     )
                     if r2.status_code == 200:
                         info = r2.json()
@@ -926,18 +934,57 @@ def upload_portfolio_csv():
         return jsonify({"error": "No file uploaded"}), 400
     
     file = request.files["file"]
-    if file.filename == "" or not file.filename.endswith(".csv"):
-        return jsonify({"error": "Please upload a CSV file"}), 400
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+    
+    file_ext = file.filename.lower().split(".")[-1]
+    if file_ext not in ["csv", "xlsx", "xls"]:
+        return jsonify({"error": "Please upload CSV or Excel file (.csv, .xlsx, .xls)"}), 400
     
     try:
-        # Read CSV content
+        # Read CSV or Excel content
         import csv
         import io
-        stream = io.StringIO(file.stream.read().decode("utf-8"), newline=None)
-        csv_reader = csv.DictReader(stream)
+        
+        if file_ext in ["xlsx", "xls"]:
+            # Parse Excel file
+            try:
+                import openpyxl
+                from io import BytesIO
+                
+                # Read Excel
+                wb = openpyxl.load_workbook(BytesIO(file.stream.read()), read_only=True)
+                ws = wb.active
+                
+                # Convert to CSV-like structure
+                rows = list(ws.iter_rows(values_only=True))
+                if not rows:
+                    return jsonify({"error": "Excel file is empty"}), 400
+                
+                # First row is headers
+                headers_raw = rows[0]
+                data_rows = rows[1:]
+                
+                # Create DictReader-like structure
+                csv_reader = [dict(zip(headers_raw, row)) for row in data_rows]
+                fieldnames = headers_raw
+                
+            except ImportError:
+                return jsonify({"error": "Excel support not installed. Please use CSV or contact support."}), 400
+            except Exception as e:
+                return jsonify({"error": f"Failed to parse Excel: {str(e)}"}), 400
+        else:
+            # Parse CSV file
+            stream = io.StringIO(file.stream.read().decode("utf-8"), newline=None)
+            csv_reader_obj = csv.DictReader(stream)
+            csv_reader = csv_reader_obj
+            fieldnames = csv_reader_obj.fieldnames
         
         # Detect column mappings (different brokers use different headers)
-        headers = [h.strip().lower() for h in csv_reader.fieldnames] if csv_reader.fieldnames else []
+        if file_ext in ["xlsx", "xls"]:
+            headers = [str(h).strip().lower() if h else "" for h in fieldnames]
+        else:
+            headers = [h.strip().lower() for h in fieldnames] if fieldnames else []
         
         if not headers:
             return jsonify({"error": "CSV file is empty or has no headers"}), 400
@@ -994,7 +1041,9 @@ def upload_portfolio_csv():
         skipped = 0
         errors = []
         
-        for i, row in enumerate(csv_reader, start=2):  # start=2 because row 1 is headers
+        # Iterate through rows
+        rows_to_process = csv_reader if file_ext in ["xlsx", "xls"] else csv_reader
+        for i, row in enumerate(rows_to_process, start=2):  # start=2 because row 1 is headers
             try:
                 # Extract data
                 symbol_raw = row.get(symbol_col, "").strip().upper()
