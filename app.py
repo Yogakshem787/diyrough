@@ -48,8 +48,8 @@ def get_client_ip():
 app = Flask(__name__)
 # Allowed origins — add every domain that hosts your frontend
 ALLOWED_ORIGINS = [
-    "https://stonksai.in",
-    "https://www.stonksai.in",
+    "https://diyinvesting.in",
+    "https://www.diyinvesting.in",
     "http://localhost:3000",
     "http://localhost:5000",
     "http://127.0.0.1:5500",   # VS Code Live Server
