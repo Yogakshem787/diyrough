@@ -1801,100 +1801,63 @@ def get_sentiment(symbol):
     # Build prompt for Grok
     current_date = datetime.now().strftime("%B %d, %Y")
     
-    prompt = f"""TODAY IS {current_date}. You are a financial analyst with REAL-TIME web search access.
+    prompt = f"""You are a financial analyst. Today is {current_date}.
 
-🔍 MANDATORY WEB SEARCH INSTRUCTIONS:
+Analyze the current market sentiment for {sym} (Indian stock listed on NSE).
 
-1. SEARCH Google for: "{sym} Q3 FY26 results" OR "{sym} Q3 FY2026 results" OR "{sym} quarterly results February 2026"
-2. SEARCH Google for: "{sym} latest news" (restrict to past 14 days)
-3. SEARCH Twitter/X for: "{sym}" OR "POLICYBZR" (if {sym} is ticker, search company name too)
-4. SEARCH Moneycontrol.com specifically: "site:moneycontrol.com {sym}"
-5. SEARCH Economic Times: "site:economictimes.indiatimes.com {sym}"
-6. SEARCH Reddit: "site:reddit.com/r/IndianStreetBets {sym}" AND "site:reddit.com/r/IndiaInvestments {sym}"
-7. SEARCH for company announcements: "{sym} NSE announcement" OR "{sym} BSE filing"
+Based on your knowledge, provide a comprehensive sentiment analysis covering:
 
-⚠️ CRITICAL RULES:
-- You MUST perform actual Google searches, not rely on training data
-- Search with multiple query variations if first search yields no results
-- For Indian stocks, also search by company full name (e.g., "PB Fintech" for POLICYBZR)
-- Check BOTH NSE and BSE websites for announcements
-- Look for Q3 FY26, Q3 FY2026, Q3 2025-26 (all formats)
-- Today is {current_date}, so "recent" means within last 14 days
+1. **Recent Quarterly Results**: What are the latest available quarterly results? (Revenue, PAT, growth YoY). If Q3 FY26 (Oct-Dec 2025) results are available, include them.
 
-📊 SPECIFIC THINGS TO SEARCH:
+2. **News & Developments**: Any recent news, corporate actions, management changes, product launches, regulatory developments in the past 1-2 months.
 
-For {sym} (Indian stock):
+3. **Social/Market Sentiment**: What is the general market buzz around this stock? Any notable analyst upgrades/downgrades? Retail investor sentiment.
 
-**Earnings/Results** (HIGHEST PRIORITY):
-- "{{sym}} Q3 results" + date range: Jan 15 - Feb 16, 2026
-- "{{sym}} quarterly results February 2026"
-- "{{sym}} earnings announcement"
-- Check: Moneycontrol earnings section, NSE/BSE filings
+4. **Key Catalysts & Risks**: What upcoming events could move the stock?
 
-**News** (past 14 days):
-- Economic Times articles about {{sym}}
-- Moneycontrol news on {{sym}}
-- Business Standard coverage of {{sym}}
-- Mint articles featuring {{sym}}
+IMPORTANT:
+- Be specific with numbers and dates where you have them
+- If you don't have recent data on something, say "No recent data available" rather than making things up
+- Indian financial year: Q3 FY26 = Oct-Dec 2025, Q4 FY26 = Jan-Mar 2026
+- Also search for the company by its full name, not just ticker
 
-**Social Media** (past 7 days):
-- Twitter/X: Search "{{sym}}" AND search company full name
-- Reddit r/IndianStreetBets: latest posts about {{sym}}
-- Reddit r/IndiaInvestments: discussions on {{sym}}
-
-**Analyst Coverage** (past 30 days):
-- "{{sym}} broker report" + February 2026
-- "{{sym}} price target" + upgrade/downgrade
-- "{{sym}} analyst recommendation" + recent
-
-**Company Actions**:
-- NSE/BSE announcements for {{sym}}
-- Company press releases
-- Investor presentations
-
-🎯 OUTPUT REQUIREMENTS:
-
-1. If you find Q3 results: Include exact date, key numbers (revenue, profit, growth %), and source
-2. If you find news: Include headline, date, and source URL/publication
-3. If you find social discussions: Include platform, date, and sentiment
-4. For each data point: MUST include date and source
-5. If truly no data found after searching: Be explicit: "Searched X sources, found no results"
-
-⛔ DO NOT SAY "Limited recent data available" unless you:
-- Explicitly searched Google for the company
-- Checked Economic Times, Moneycontrol, Business Standard
-- Searched Twitter/X with both ticker and company name
-- Checked Reddit forums
-- Verified no NSE/BSE announcements
-
-Format response as JSON:
+Respond ONLY with valid JSON (no markdown, no backticks):
 {{{{
-  "overall": "Positive/Neutral/Negative",
-  "overallScore": 7,
-  "summary": "Include specific dates and events found in search",
+  "overall": "Positive" or "Neutral" or "Negative",
+  "overallScore": 1-10,
+  "summary": "2-3 sentence summary with specific data points",
   "categories": [
     {{{{
-      "name": "Category Name",
-      "sentiment": "Positive/Neutral/Negative",
-      "score": 8,
-      "points": [
-        "Specific point WITH date and source (e.g., 'Feb 2, 2026: Q3 results...')",
-        "Another point with date and source"
-      ]
+      "name": "Quarterly Results",
+      "sentiment": "Positive" or "Neutral" or "Negative",
+      "score": 1-10,
+      "points": ["Specific point with numbers and dates"]
+    }}}},
+    {{{{
+      "name": "News & Developments",
+      "sentiment": "Positive" or "Neutral" or "Negative",
+      "score": 1-10,
+      "points": ["Specific recent news items"]
+    }}}},
+    {{{{
+      "name": "Market Sentiment",
+      "sentiment": "Positive" or "Neutral" or "Negative",
+      "score": 1-10,
+      "points": ["Analyst views, retail sentiment"]
+    }}}},
+    {{{{
+      "name": "Upcoming Catalysts",
+      "sentiment": "Positive" or "Neutral" or "Negative",
+      "score": 1-10,
+      "points": ["Key upcoming events"]
     }}}}
   ],
-  "recentTriggers": ["Event with specific date"],
-  "recommendation": "Based on search findings",
-  "searchesPerformed": "List what you actually searched for",
-  "dataFreshness": "Mention date range of data and sources checked"
-}}}}
-
-🔍 SEARCH NOW for {sym} and provide analysis based on ACTUAL search results, not assumptions."""
+  "recentTriggers": ["List of 2-3 recent events that moved or could move the stock"],
+  "recommendation": "Overall assessment in 1-2 sentences"
+}}}}"""
 
     try:
         log.info(f"[SENTIMENT] Starting analysis for {sym}")
-        log.info(f"[SENTIMENT] API Key present: {bool(GROK_API_KEY)}")
-        log.info(f"[SENTIMENT] API Key starts with: {GROK_API_KEY[:10] if GROK_API_KEY else 'NONE'}...")
         
         headers = {
             "Content-Type": "application/json",
@@ -1905,16 +1868,16 @@ Format response as JSON:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a financial analyst expert at analyzing market sentiment. Provide factual, data-driven analysis."
+                    "content": "You are a senior Indian equity analyst. Provide factual, data-driven analysis. Always include specific numbers and dates. Respond ONLY with valid JSON, no markdown formatting."
                 },
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            "model": "grok-4-1-fast-reasoning",
+            "model": "grok-3-latest",
             "stream": False,
-            "temperature": 0.3
+            "temperature": 0.2
         }
         
         response = requests.post(
@@ -2772,15 +2735,13 @@ def search_stocks():
 
 @app.route("/api/stocklist")
 def stock_list():
-    """Return ALL NSE stock symbols + names in one lightweight call. Cached 24h.
-    This powers instant client-side search without per-keystroke API calls."""
+    """Return ALL NSE stock symbols + names in one lightweight call. Cached 24h."""
     ck = "stocklist:v1"
-    c = cached(ck, 86400)  # 24h cache
+    c = cached(ck, 86400)
     if c is not None:
         return jsonify(c)
 
     stocks = []
-    # Method 1: nsetools (fastest, no rate limit)
     try:
         from nsetools import Nse
         nse = Nse()
@@ -2796,27 +2757,10 @@ def stock_list():
     except Exception as e:
         log.debug(f"[STOCKLIST] nsetools failed: {e}")
 
-    # Method 2: NSE API market status page
-    try:
-        s = _get_nse_session()
-        if s:
-            r = s.get("https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O", timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                for item in (data.get("data") or []):
-                    sym = item.get("symbol", "")
-                    name = item.get("meta", {}).get("companyName", "") or item.get("companyName", "") or sym
-                    if sym and not any(st["sym"] == sym for st in stocks):
-                        stocks.append({"sym": sym, "name": name, "sec": "NSE"})
-    except Exception as e:
-        log.debug(f"[STOCKLIST] NSE FnO failed: {e}")
-
-    # Method 3: hardcoded popular + use nifty indices
     for idx in ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%2050", "NIFTY%20BANK", "NIFTY%20IT", "NIFTY%20PHARMA"]:
         try:
             s = _get_nse_session()
-            if not s:
-                break
+            if not s: break
             r = s.get(f"https://www.nseindia.com/api/equity-stockIndices?index={idx}", timeout=8)
             if r.status_code == 200:
                 data = r.json()
@@ -2825,13 +2769,87 @@ def stock_list():
                     name = item.get("meta", {}).get("companyName", "") or sym
                     if sym and not any(st["sym"] == sym for st in stocks):
                         stocks.append({"sym": sym, "name": name, "sec": "NSE"})
-        except:
-            continue
+        except: continue
 
     if stocks:
         log.info(f"[STOCKLIST] Combined: {len(stocks)} stocks")
         set_cache(ck, stocks, 86400)
     return jsonify(stocks)
+
+
+@app.route("/api/batch-prices", methods=["POST"])
+def batch_prices():
+    """Fetch live prices for multiple symbols at once. Used by watchlist/portfolio/screens.
+    Accepts: {"symbols": ["RELIANCE","TCS",...]}
+    Returns: {"RELIANCE": {"cmp": 1286, "mcap_cr": 870000, "pe": 23.5, "dayChangePct": 0.5}, ...}
+    """
+    data = request.get_json() or {}
+    symbols = data.get("symbols", [])
+    if not symbols or len(symbols) > 50:
+        return jsonify({"error": "Provide 1-50 symbols"}), 400
+    
+    prices = {}
+    for sym in symbols:
+        sym = sym.upper().strip()
+        if not sym:
+            continue
+        # Check cache first (quote cache, 5 min TTL)
+        ck = f"bq:{sym}"
+        c = cached(ck, 300)
+        if c:
+            prices[sym] = c
+            continue
+        
+        # Fetch from nsetools (fast, no rate limit)
+        try:
+            from nsetools import Nse
+            nse = Nse()
+            q = nse.get_quote(sym)
+            if q and q.get("lastPrice"):
+                price_data = {
+                    "cmp": q["lastPrice"],
+                    "mcap_cr": round(q.get("totalTradedValue", 0) / 1e5, 2) if q.get("totalTradedValue") else 0,
+                    "pe": q.get("pE", 0) or 0,
+                    "dayChangePct": q.get("pChange", 0) or 0,
+                }
+                # Try to get mcap from other field
+                if price_data["mcap_cr"] == 0 and q.get("issuedSize") and q.get("lastPrice"):
+                    price_data["mcap_cr"] = round(q["issuedSize"] * q["lastPrice"] / 1e7, 2)
+                prices[sym] = price_data
+                set_cache(ck, price_data, 300)
+                continue
+        except Exception as e:
+            log.debug(f"[BATCH] nsetools failed for {sym}: {e}")
+        
+        # Fallback: use existing fullstock cache
+        fck = f"f:{sym}"
+        fc = cached(fck, 600)
+        if fc and fc.get("cmp"):
+            prices[sym] = {
+                "cmp": fc["cmp"],
+                "mcap_cr": fc.get("mcapCr", 0),
+                "pe": fc.get("pe", 0),
+                "dayChangePct": fc.get("dayChangePct", 0),
+            }
+            continue
+        
+        # Last resort: quick yfinance
+        try:
+            t = yf.Ticker(f"{sym}.NS")
+            info = t.info
+            if info and info.get("regularMarketPrice"):
+                price_data = {
+                    "cmp": info["regularMarketPrice"],
+                    "mcap_cr": round(info.get("marketCap", 0) / 1e7, 2),
+                    "pe": info.get("trailingPE", 0) or 0,
+                    "dayChangePct": round(((info.get("regularMarketPrice",0) - info.get("regularMarketPreviousClose",1)) / max(info.get("regularMarketPreviousClose",1),1)) * 100, 2),
+                }
+                prices[sym] = price_data
+                set_cache(ck, price_data, 300)
+        except Exception as e:
+            log.debug(f"[BATCH] yf failed for {sym}: {e}")
+    
+    return jsonify(prices)
 
 
 @app.route("/api/fullstock/<symbol>")
