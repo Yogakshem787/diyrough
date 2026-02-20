@@ -2761,13 +2761,77 @@ def solveGrowth(pat, mcap, rPct, n, pe):
 @app.route("/api/search")
 def search_stocks():
     q = request.args.get("q", "").strip()
-    if not q or len(q) < 2: return jsonify([])
+    if not q or len(q) < 1: return jsonify([])
     ck = f"s:{q.lower()}"
     c = cached(ck, SEARCH_TTL)
     if c is not None: return jsonify(c)
     results = yf_search(q)
     set_cache(ck, results)
     return jsonify(results)
+
+
+@app.route("/api/stocklist")
+def stock_list():
+    """Return ALL NSE stock symbols + names in one lightweight call. Cached 24h.
+    This powers instant client-side search without per-keystroke API calls."""
+    ck = "stocklist:v1"
+    c = cached(ck, 86400)  # 24h cache
+    if c is not None:
+        return jsonify(c)
+
+    stocks = []
+    # Method 1: nsetools (fastest, no rate limit)
+    try:
+        from nsetools import Nse
+        nse = Nse()
+        all_stocks = nse.get_stock_codes()
+        for sym, name in all_stocks.items():
+            if sym == "SYMBOL" or not sym:
+                continue
+            stocks.append({"sym": sym, "name": name, "sec": "NSE"})
+        if stocks:
+            log.info(f"[STOCKLIST] nsetools: {len(stocks)} stocks")
+            set_cache(ck, stocks, 86400)
+            return jsonify(stocks)
+    except Exception as e:
+        log.debug(f"[STOCKLIST] nsetools failed: {e}")
+
+    # Method 2: NSE API market status page
+    try:
+        s = _get_nse_session()
+        if s:
+            r = s.get("https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O", timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                for item in (data.get("data") or []):
+                    sym = item.get("symbol", "")
+                    name = item.get("meta", {}).get("companyName", "") or item.get("companyName", "") or sym
+                    if sym and not any(st["sym"] == sym for st in stocks):
+                        stocks.append({"sym": sym, "name": name, "sec": "NSE"})
+    except Exception as e:
+        log.debug(f"[STOCKLIST] NSE FnO failed: {e}")
+
+    # Method 3: hardcoded popular + use nifty indices
+    for idx in ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%2050", "NIFTY%20BANK", "NIFTY%20IT", "NIFTY%20PHARMA"]:
+        try:
+            s = _get_nse_session()
+            if not s:
+                break
+            r = s.get(f"https://www.nseindia.com/api/equity-stockIndices?index={idx}", timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                for item in (data.get("data") or []):
+                    sym = item.get("symbol", "")
+                    name = item.get("meta", {}).get("companyName", "") or sym
+                    if sym and not any(st["sym"] == sym for st in stocks):
+                        stocks.append({"sym": sym, "name": name, "sec": "NSE"})
+        except:
+            continue
+
+    if stocks:
+        log.info(f"[STOCKLIST] Combined: {len(stocks)} stocks")
+        set_cache(ck, stocks, 86400)
+    return jsonify(stocks)
 
 
 @app.route("/api/fullstock/<symbol>")
