@@ -478,6 +478,30 @@ class StockCache(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+class ArticleComment(db.Model):
+    """Comments on prop research articles."""
+    __tablename__ = "article_comments"
+    id = db.Column(db.Integer, primary_key=True)
+    article_id = db.Column(db.Integer, db.ForeignKey("prop_research.id"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    parent_id = db.Column(db.Integer, nullable=True)  # for replies
+    text = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user = db.relationship("User", backref="comments")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "articleId": self.article_id,
+            "parentId": self.parent_id,
+            "text": self.text,
+            "author": self.user.name or self.user.email.split("@")[0] if self.user else "Anonymous",
+            "isAdmin": self.user.is_admin if self.user else False,
+            "createdAt": self.created_at.isoformat(),
+        }
+
+
 # ═══════ AUTH HELPERS ═══════
 
 def hash_password(pwd):
@@ -2051,6 +2075,50 @@ def delete_prop_research(research_id):
     research.is_active = False
     db.session.commit()
     return jsonify({"status": "deleted"})
+
+
+# ═══════ ARTICLE COMMENTS ═══════
+
+@app.route("/api/prop-research/<int:article_id>/comments")
+def get_article_comments(article_id):
+    """Get all comments for an article"""
+    try:
+        comments = ArticleComment.query.filter_by(article_id=article_id).order_by(ArticleComment.created_at.asc()).all()
+        return jsonify([c.to_dict() for c in comments])
+    except Exception as e:
+        log.warning(f"[COMMENTS] Error fetching: {e}")
+        # Table might not exist yet
+        return jsonify([])
+
+
+@app.route("/api/prop-research/<int:article_id>/comments", methods=["POST"])
+@auth_required
+def post_article_comment(article_id):
+    """Post a comment or reply on an article"""
+    data = request.get_json() or {}
+    text = (data.get("text") or "").strip()
+    if not text or len(text) > 2000:
+        return jsonify({"error": "Comment must be 1-2000 characters"}), 400
+    
+    parent_id = data.get("parentId")
+    
+    try:
+        comment = ArticleComment(
+            article_id=article_id,
+            user_id=request.user.id,
+            parent_id=parent_id,
+            text=text
+        )
+        db.session.add(comment)
+        db.session.commit()
+        
+        # Return all comments for this article
+        comments = ArticleComment.query.filter_by(article_id=article_id).order_by(ArticleComment.created_at.asc()).all()
+        return jsonify([c.to_dict() for c in comments])
+    except Exception as e:
+        log.warning(f"[COMMENTS] Error posting: {e}")
+        db.session.rollback()
+        return jsonify({"error": "Could not post comment. Try again later."}), 500
 
 
 # ═══════ MULTI-SOURCE STOCK DATA ENGINE ═══════
