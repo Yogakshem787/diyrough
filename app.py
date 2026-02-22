@@ -1205,72 +1205,66 @@ def delete_watchlist(item_id):
 @app.route("/api/portfolio")
 @auth_required
 def get_portfolio():
-    """Get user's portfolio holdings with live DCF analysis (optimized batch fetch)."""
+    """Get user's portfolio holdings. Returns instantly with stored data.
+    Live prices are fetched separately via /api/batch-prices."""
     holdings = Portfolio.query.filter_by(user_id=g.user.id).order_by(Portfolio.buy_date.desc()).all()
     
     if not holdings:
         return jsonify([])
     
-    # Batch fetch: collect unique symbols, fetch quotes once each
+    # Collect unique symbols for batch cache lookup
     unique_symbols = list(set(h.symbol.upper() for h in holdings))
     quotes = {}
     financials_map = {}
     
     for sym in unique_symbols:
-        # Quote (uses cache, so won't hit yfinance if already cached)
-        q = yf_quote(sym)
+        # Only use CACHED quotes — never block on network fetch
+        qck = f"q:{sym}"
+        q = cached(qck, 600)  # 10 min cache
         if q:
             quotes[sym] = q
-        # Financials
+        # Financials from cache only
         fck = f"fin:{sym}"
         years = cached(fck, FIN_TTL)
         if years is None:
-            years = yf_financials(sym)
-            if years:
-                set_cache(fck, years, FIN_TTL)
-                set_cache(f"stale_fin:{sym}", years, 604800)
-            else:
-                # Serve stale financials rather than nothing
-                years = cached(f"stale_fin:{sym}", 604800)
+            years = cached(f"stale_fin:{sym}", 604800)
         financials_map[sym] = years or []
     
     result = []
-    price_updated = False
     for h in holdings:
         sym = h.symbol.upper()
-        quote = quotes.get(sym)
+        quote = quotes.get(sym) or {}
         years = financials_map.get(sym, [])
         
-        # Update current price from quote
-        if quote:
-            h.current_price = quote.get('cmp', 0)
-            price_updated = True
+        # Use cached live price if available, else stored price
+        cmp = quote.get('cmp', h.current_price) or h.current_price
         
         pat = years[0].get('pat', 0) if years and len(years) > 0 else 0
         
         # Calculate DCF metrics
         invested = h.quantity * h.buy_price
-        current_value = h.quantity * h.current_price
+        current_value = h.quantity * cmp
         pnl = current_value - invested
         pnl_pct = (pnl / invested * 100) if invested > 0 else 0
         
         # Implied growth calculation
         implied_growth = None
-        if pat > 0 and h.current_price > 0:
+        if pat > 0 and cmp > 0:
             shares_cr = 0
-            if quote and quote.get('shares_cr'):
+            if quote.get('shares_cr'):
                 shares_cr = quote.get('shares_cr')
-            elif quote and quote.get('mcap_cr'):
-                shares_cr = quote['mcap_cr'] / h.current_price if h.current_price > 0 else 0
+            elif quote.get('mcap_cr'):
+                shares_cr = quote['mcap_cr'] / cmp if cmp > 0 else 0
             
             if shares_cr > 0:
-                mcap = h.current_price * shares_cr
+                mcap = cmp * shares_cr
                 implied_growth = solveGrowth(
                     pat, mcap, h.discount_rate, h.forecast_years, h.exit_pe
                 )
         
         result.append({
             **h.to_dict(),
+            "currentPrice": round(cmp, 2),
             "invested": round(invested, 2),
             "currentValue": round(current_value, 2),
             "pnl": round(pnl, 2),
@@ -1278,13 +1272,6 @@ def get_portfolio():
             "pat": pat,
             "impliedGrowth": implied_growth,
         })
-    
-    # Single commit for all price updates (instead of per-holding)
-    if price_updated:
-        try:
-            db.session.commit()
-        except:
-            db.session.rollback()
     
     return jsonify(result)
 
@@ -2180,16 +2167,21 @@ def create_prop_research():
     # Accept both snake_case (admin form) and camelCase
     def gd(snake, camel, default=""):
         return data.get(snake, data.get(camel, default))
+    def gdf(snake, camel, default=0):
+        val = data.get(snake, data.get(camel, default))
+        if val == "" or val is None: return default
+        try: return float(val)
+        except: return default
 
     research = PropResearch(
         title=       gd("title",        "title"),
         symbol=      gd("symbol",       "symbol").upper(),
         sector=      gd("sector",       "sector"),
         thesis=      gd("thesis",       "thesis"),
-        target_cagr= gd("target_cagr",  "targetCagr",  25),
+        target_cagr= gdf("target_cagr",  "targetCagr",  25),
         time_horizon=gd("time_horizon", "timeHorizon", "12"),
-        entry_price= gd("entry_price",  "entryPrice",  0),
-        target_price=gd("target_price", "targetPrice", 0),
+        entry_price= gdf("entry_price",  "entryPrice",  0),
+        target_price=gdf("target_price", "targetPrice", 0),
         risks=       gd("risks",        "risks"),
         catalysts=   gd("catalysts",    "catalysts"),
         content=     gd("content",      "content"),
@@ -2215,21 +2207,36 @@ def update_prop_research(research_id):
     data = request.json or {}
     # Accept both snake_case (from form) and camelCase (legacy)
     def get(snake, camel, default):
-        return data.get(snake, data.get(camel, default))
+        val = data.get(snake, data.get(camel, default))
+        return val
+    def getf(snake, camel, default):
+        """Get float value, treating empty string as default"""
+        val = data.get(snake, data.get(camel, default))
+        if val == "" or val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
     research.title       = get("title",        "title",       research.title)
-    research.symbol      = get("symbol",        "symbol",      research.symbol or "").upper()
+    research.symbol      = (get("symbol",       "symbol",      research.symbol) or "").upper()
     research.sector      = get("sector",        "sector",      research.sector)
     research.thesis      = get("thesis",        "thesis",      research.thesis)
-    research.target_cagr = get("target_cagr",   "targetCagr",  research.target_cagr)
+    research.target_cagr = getf("target_cagr",   "targetCagr",  research.target_cagr)
     research.time_horizon= get("time_horizon",  "timeHorizon", research.time_horizon)
-    research.entry_price = get("entry_price",   "entryPrice",  research.entry_price)
-    research.target_price= get("target_price",  "targetPrice", research.target_price)
+    research.entry_price = getf("entry_price",   "entryPrice",  research.entry_price)
+    research.target_price= getf("target_price",  "targetPrice", research.target_price)
     research.risks       = get("risks",         "risks",       research.risks)
     research.catalysts   = get("catalysts",     "catalysts",   research.catalysts)
     research.content     = get("content",       "content",     research.content)
     research.is_active   = get("isActive",      "isActive",    research.is_active)
     
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"[PROP RESEARCH] Update error: {e}")
+        return jsonify({"error": f"Save failed: {str(e)[:200]}"}), 500
     return jsonify(research.to_dict())
 
 
