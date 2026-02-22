@@ -478,6 +478,47 @@ class StockCache(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+class StockMaster(db.Model):
+    """
+    Master list of all NSE/BSE stocks for instant search.
+    Populated via admin endpoint from uploaded CSV.
+    Search queries this table locally — ZERO external API calls.
+    """
+    __tablename__ = "stock_master"
+    symbol = db.Column(db.String(30), primary_key=True)
+    name = db.Column(db.String(300), default="", index=True)
+    sector = db.Column(db.String(100), default="")
+    exchange = db.Column(db.String(10), default="NSE")
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class CuratedScreen(db.Model):
+    """Admin-managed curated screens (like articles but for stock screens)."""
+    __tablename__ = "curated_screens"
+    id = db.Column(db.Integer, primary_key=True)
+    screen_id = db.Column(db.String(50), unique=True, nullable=False)  # e.g. "bluechip"
+    title = db.Column(db.String(200), nullable=False)
+    emoji = db.Column(db.String(10), default="📊")
+    description = db.Column(db.Text, default="")
+    stocks_json = db.Column(db.Text, default="[]")  # JSON array of {sym, pe, dr, fy, ec}
+    is_active = db.Column(db.Boolean, default=True)
+    sort_order = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "screenId": self.screen_id,
+            "title": self.title,
+            "emoji": self.emoji,
+            "desc": self.description,
+            "stocks": json.loads(self.stocks_json) if self.stocks_json else [],
+            "isActive": self.is_active,
+            "sortOrder": self.sort_order,
+        }
+
+
 class ArticleComment(db.Model):
     """Comments on prop research articles."""
     __tablename__ = "article_comments"
@@ -1758,187 +1799,314 @@ def admin_cleanup_cache():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-# ═══════ SENTIMENT ANALYSIS (GROK) ═══════
+# ═══════ SENTIMENT ANALYSIS — REMOVED ═══════
+# Grok-based sentiment was unreliable. Removed to avoid showing wrong data.
+# If re-implemented later, consider using a proper news API + NLP pipeline.
 
 @app.route("/api/sentiment/<symbol>")
 @auth_required
 def get_sentiment(symbol):
-    """Analyze stock sentiment using Grok API"""
+    """Sentiment analysis has been temporarily removed for quality improvements."""
+    return jsonify({
+        "error": "Sentiment analysis is temporarily unavailable. We are upgrading to a more accurate system.",
+        "status": "coming_soon"
+    }), 503
+
+
+# ═══════ STOCK MASTER ADMIN ═══════
+
+@app.route("/api/admin/stockmaster/upload", methods=["POST"])
+@auth_required
+@admin_required
+def admin_upload_stockmaster():
+    """
+    Upload CSV to populate stock_master table.
+    CSV must have columns: symbol, name (and optionally: sector, exchange)
+    Accepts NSE bhav copy or custom CSVs.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
     
-    if not GROK_API_KEY:
-        log.warning("[SENTIMENT] GROK_API_KEY not configured - returning mock data")
-        # Return mock sentiment data for demo purposes
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+    
+    import csv, io
+    
+    try:
+        # Read CSV
+        stream = io.StringIO(file.stream.read().decode("utf-8"), newline=None)
+        reader = csv.DictReader(stream)
+        headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+        
+        if not headers:
+            return jsonify({"error": "CSV has no headers"}), 400
+        
+        # Detect column mappings (flexible for different CSV formats)
+        def find_col(patterns):
+            for p in patterns:
+                for h in headers:
+                    if re.search(p, h, re.IGNORECASE):
+                        return h
+            return None
+        
+        sym_col = find_col([r'^symbol', r'^trading.*symbol', r'^scrip.*code', r'^ticker', r'^isin_code'])
+        name_col = find_col([r'^name', r'^company', r'^scrip.*name', r'^security', r'^issuer'])
+        sector_col = find_col([r'^sector', r'^industry', r'^series'])
+        exchange_col = find_col([r'^exchange', r'^market', r'^segment'])
+        
+        if not sym_col:
+            return jsonify({"error": f"Could not find Symbol column. Headers: {', '.join(headers[:8])}"}), 400
+        if not name_col:
+            return jsonify({"error": f"Could not find Name column. Headers: {', '.join(headers[:8])}"}), 400
+        
+        # Parse rows
+        added = 0
+        updated = 0
+        skipped = 0
+        
+        for row in reader:
+            sym_raw = (row.get(sym_col) or "").strip().upper()
+            name_raw = (row.get(name_col) or "").strip()
+            sector_raw = (row.get(sector_col) or "").strip() if sector_col else ""
+            exchange_raw = (row.get(exchange_col) or "NSE").strip() if exchange_col else "NSE"
+            
+            # Clean symbol
+            sym = re.sub(r'\.(NS|BO|BSE|NSE)$', '', sym_raw)
+            sym = re.sub(r'[^A-Z0-9&\-]', '', sym)
+            
+            if not sym or len(sym) > 30 or not name_raw:
+                skipped += 1
+                continue
+            
+            # Upsert
+            existing = StockMaster.query.get(sym)
+            if existing:
+                existing.name = name_raw
+                if sector_raw:
+                    existing.sector = sector_raw
+                existing.exchange = exchange_raw
+                existing.updated_at = datetime.utcnow()
+                updated += 1
+            else:
+                sm = StockMaster(
+                    symbol=sym,
+                    name=name_raw,
+                    sector=sector_raw,
+                    exchange=exchange_raw,
+                )
+                db.session.add(sm)
+                added += 1
+        
+        db.session.commit()
+        
+        # Invalidate stocklist cache
+        try:
+            cache.pop("stocklist:v2", None)
+            entry = StockCache.query.get("stocklist:v2")
+            if entry:
+                db.session.delete(entry)
+                db.session.commit()
+        except:
+            pass
+        
+        total = StockMaster.query.count()
+        log.info(f"[STOCKMASTER] Upload complete: added={added}, updated={updated}, skipped={skipped}, total={total}")
+        
         return jsonify({
-            "overall": "Neutral",
-            "overallScore": 6,
-            "summary": f"Sentiment analysis for {symbol.upper()} is currently in demo mode. Configure GROK_API_KEY environment variable to enable live AI-powered analysis.",
-            "categories": [
-                {
-                    "name": "Social Media",
-                    "sentiment": "Neutral",
-                    "score": 6,
-                    "points": ["Demo mode active", "Configure Grok API key for live analysis"]
-                },
-                {
-                    "name": "News Sentiment",
-                    "sentiment": "Neutral",
-                    "score": 6,
-                    "points": ["Demo mode active", "Real-time news analysis available with API key"]
-                },
-                {
-                    "name": "Analyst Sentiment",
-                    "sentiment": "Neutral",
-                    "score": 6,
-                    "points": ["Demo mode active", "Analyst views available with API key"]
-                }
-            ],
-            "recentTriggers": ["Demo mode - Add GROK_API_KEY to enable live analysis"],
-            "recommendation": "This is demo sentiment data. Get your Grok API key from https://x.ai/api and add it to your environment variables as GROK_API_KEY to enable real AI-powered sentiment analysis."
+            "success": True,
+            "added": added,
+            "updated": updated,
+            "skipped": skipped,
+            "total": total,
+            "message": f"Stock master updated: {added} added, {updated} updated, {total} total stocks",
         })
     
-    sym = symbol.upper()
-    
-    # Build prompt for Grok
-    current_date = datetime.now().strftime("%B %d, %Y")
-    
-    prompt = f"""You are a financial analyst. Today is {current_date}.
-
-Analyze the current market sentiment for {sym} (Indian stock listed on NSE).
-
-Based on your knowledge, provide a comprehensive sentiment analysis covering:
-
-1. **Recent Quarterly Results**: What are the latest available quarterly results? (Revenue, PAT, growth YoY). If Q3 FY26 (Oct-Dec 2025) results are available, include them.
-
-2. **News & Developments**: Any recent news, corporate actions, management changes, product launches, regulatory developments in the past 1-2 months.
-
-3. **Social/Market Sentiment**: What is the general market buzz around this stock? Any notable analyst upgrades/downgrades? Retail investor sentiment.
-
-4. **Key Catalysts & Risks**: What upcoming events could move the stock?
-
-IMPORTANT:
-- Be specific with numbers and dates where you have them
-- If you don't have recent data on something, say "No recent data available" rather than making things up
-- Indian financial year: Q3 FY26 = Oct-Dec 2025, Q4 FY26 = Jan-Mar 2026
-- Also search for the company by its full name, not just ticker
-
-Respond ONLY with valid JSON (no markdown, no backticks):
-{{{{
-  "overall": "Positive" or "Neutral" or "Negative",
-  "overallScore": 1-10,
-  "summary": "2-3 sentence summary with specific data points",
-  "categories": [
-    {{{{
-      "name": "Quarterly Results",
-      "sentiment": "Positive" or "Neutral" or "Negative",
-      "score": 1-10,
-      "points": ["Specific point with numbers and dates"]
-    }}}},
-    {{{{
-      "name": "News & Developments",
-      "sentiment": "Positive" or "Neutral" or "Negative",
-      "score": 1-10,
-      "points": ["Specific recent news items"]
-    }}}},
-    {{{{
-      "name": "Market Sentiment",
-      "sentiment": "Positive" or "Neutral" or "Negative",
-      "score": 1-10,
-      "points": ["Analyst views, retail sentiment"]
-    }}}},
-    {{{{
-      "name": "Upcoming Catalysts",
-      "sentiment": "Positive" or "Neutral" or "Negative",
-      "score": 1-10,
-      "points": ["Key upcoming events"]
-    }}}}
-  ],
-  "recentTriggers": ["List of 2-3 recent events that moved or could move the stock"],
-  "recommendation": "Overall assessment in 1-2 sentences"
-}}}}"""
-
-    try:
-        log.info(f"[SENTIMENT] Starting analysis for {sym}")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROK_API_KEY}"
-        }
-        
-        payload = {
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a senior Indian equity analyst. Provide factual, data-driven analysis. Always include specific numbers and dates. Respond ONLY with valid JSON, no markdown formatting."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "model": "grok-3-latest",
-            "stream": False,
-            "temperature": 0.2
-        }
-        
-        response = requests.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            log.error(f"[GROK ERROR] Status: {response.status_code}")
-            log.error(f"[GROK ERROR] Response: {response.text}")
-            
-            # Return user-friendly error based on status code
-            if response.status_code == 401:
-                return jsonify({
-                    "error": "Invalid Grok API key. Please check your GROK_API_KEY environment variable.",
-                    "details": "Authentication failed"
-                }), 401
-            elif response.status_code == 429:
-                return jsonify({
-                    "error": "Rate limit exceeded. Please try again in a few moments.",
-                    "details": "Too many requests"
-                }), 429
-            elif response.status_code == 403:
-                return jsonify({
-                    "error": "Access forbidden. Check if your Grok API key has sufficient credits.",
-                    "details": "Insufficient permissions or credits"
-                }), 403
-            else:
-                return jsonify({
-                    "error": f"Grok API error (Status: {response.status_code})",
-                    "details": response.text[:200] if response.text else "Unknown error"
-                }), 500
-        
-        result = response.json()
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        
-        # Try to parse JSON from content
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
-        if json_match:
-            sentiment_data = json.loads(json_match.group())
-            return jsonify(sentiment_data)
-        else:
-            # Return raw content if JSON parsing fails
-            return jsonify({
-                "overall": "Neutral",
-                "overallScore": 5,
-                "summary": content[:500],
-                "raw": content
-            })
-    
-    except requests.exceptions.Timeout:
-        log.error(f"[SENTIMENT TIMEOUT] {sym}")
-        return jsonify({"error": "Request timeout - Grok API is taking too long. Please try again."}), 504
-    except requests.exceptions.RequestException as e:
-        log.error(f"[SENTIMENT REQUEST ERROR] {sym}: {e}")
-        return jsonify({"error": "Failed to connect to Grok API. Check your API key and internet connection."}), 500
     except Exception as e:
-        log.error(f"[SENTIMENT ERROR] {sym}: {e}")
-        return jsonify({"error": f"Sentiment analysis failed: {str(e)}"}), 500
+        db.session.rollback()
+        log.error(f"[STOCKMASTER] Upload error: {e}")
+        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
+
+
+@app.route("/api/admin/stockmaster/stats")
+@auth_required
+@admin_required
+def admin_stockmaster_stats():
+    """Get stock_master table stats."""
+    try:
+        total = StockMaster.query.count()
+        nse = StockMaster.query.filter_by(exchange="NSE").count()
+        bse = StockMaster.query.filter_by(exchange="BSE").count()
+        return jsonify({"total": total, "nse": nse, "bse": bse})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════ CURATED SCREENS ADMIN ═══════
+
+@app.route("/api/screens")
+def get_screens():
+    """Get all active curated screens (public endpoint)."""
+    try:
+        screens = CuratedScreen.query.filter_by(is_active=True).order_by(CuratedScreen.sort_order).all()
+        if screens:
+            return jsonify([s.to_dict() for s in screens])
+    except Exception as e:
+        log.debug(f"[SCREENS] DB read failed: {e}")
+    # Return empty if no screens in DB yet (frontend has hardcoded fallback)
+    return jsonify([])
+
+
+@app.route("/api/admin/screens")
+@auth_required
+@admin_required
+def admin_get_screens():
+    """Admin: get all screens including inactive."""
+    try:
+        screens = CuratedScreen.query.order_by(CuratedScreen.sort_order).all()
+        return jsonify([s.to_dict() for s in screens])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/admin/screens", methods=["POST"])
+@auth_required
+@admin_required
+def admin_create_screen():
+    """Admin: create a new curated screen."""
+    data = request.json or {}
+    screen_id = data.get("screenId", "").strip().lower().replace(" ", "-")
+    if not screen_id or not data.get("title"):
+        return jsonify({"error": "screenId and title required"}), 400
+    
+    existing = CuratedScreen.query.filter_by(screen_id=screen_id).first()
+    if existing:
+        return jsonify({"error": f"Screen '{screen_id}' already exists. Use PUT to update."}), 400
+    
+    screen = CuratedScreen(
+        screen_id=screen_id,
+        title=data.get("title", ""),
+        emoji=data.get("emoji", "📊"),
+        description=data.get("desc", ""),
+        stocks_json=json.dumps(data.get("stocks", [])),
+        is_active=data.get("isActive", True),
+        sort_order=data.get("sortOrder", 0),
+    )
+    db.session.add(screen)
+    db.session.commit()
+    log.info(f"[SCREENS] Created screen: {screen_id}")
+    return jsonify(screen.to_dict())
+
+
+@app.route("/api/admin/screens/<int:screen_db_id>", methods=["PUT"])
+@auth_required
+@admin_required
+def admin_update_screen(screen_db_id):
+    """Admin: update a curated screen."""
+    screen = CuratedScreen.query.get(screen_db_id)
+    if not screen:
+        return jsonify({"error": "Screen not found"}), 404
+    
+    data = request.json or {}
+    if "title" in data:
+        screen.title = data["title"]
+    if "emoji" in data:
+        screen.emoji = data["emoji"]
+    if "desc" in data:
+        screen.description = data["desc"]
+    if "stocks" in data:
+        screen.stocks_json = json.dumps(data["stocks"])
+    if "isActive" in data:
+        screen.is_active = data["isActive"]
+    if "sortOrder" in data:
+        screen.sort_order = data["sortOrder"]
+    
+    db.session.commit()
+    log.info(f"[SCREENS] Updated screen: {screen.screen_id}")
+    return jsonify(screen.to_dict())
+
+
+@app.route("/api/admin/screens/<int:screen_db_id>", methods=["DELETE"])
+@auth_required
+@admin_required
+def admin_delete_screen(screen_db_id):
+    """Admin: delete a curated screen."""
+    screen = CuratedScreen.query.get(screen_db_id)
+    if not screen:
+        return jsonify({"error": "Screen not found"}), 404
+    
+    db.session.delete(screen)
+    db.session.commit()
+    log.info(f"[SCREENS] Deleted screen: {screen.screen_id}")
+    return jsonify({"status": "deleted"})
+
+
+@app.route("/api/admin/screens/seed-defaults", methods=["POST"])
+@auth_required
+@admin_required
+def admin_seed_default_screens():
+    """Admin: seed the default hardcoded screens into the DB for the first time."""
+    DEFAULT_SCREENS = [
+        {"screen_id": "bluechip", "title": "Bluechip 20", "emoji": "💎", "desc": "Large & Mega cap stocks with conservative assumptions.", "sort_order": 1,
+         "stocks": [
+            {"sym":"RELIANCE","pe":10,"dr":13,"fy":10,"ec":12},{"sym":"TCS","pe":22,"dr":13,"fy":10,"ec":12},
+            {"sym":"HDFCBANK","pe":15,"dr":13,"fy":10,"ec":14},{"sym":"INFY","pe":22,"dr":13,"fy":10,"ec":11},
+            {"sym":"ICICIBANK","pe":15,"dr":15,"fy":10,"ec":14},{"sym":"ITC","pe":45,"dr":13,"fy":10,"ec":9},
+            {"sym":"SBIN","pe":15,"dr":15,"fy":10,"ec":12},{"sym":"BAJFINANCE","pe":20,"dr":15,"fy":10,"ec":18},
+            {"sym":"TITAN","pe":35,"dr":15,"fy":10,"ec":18},{"sym":"ASIANPAINT","pe":55,"dr":13,"fy":10,"ec":14},
+            {"sym":"LT","pe":20,"dr":13,"fy":10,"ec":14},{"sym":"WIPRO","pe":20,"dr":13,"fy":10,"ec":10},
+            {"sym":"MARUTI","pe":22,"dr":13,"fy":10,"ec":12},{"sym":"AXISBANK","pe":12,"dr":15,"fy":10,"ec":14},
+            {"sym":"KOTAKBANK","pe":18,"dr":13,"fy":10,"ec":14}
+         ]},
+        {"screen_id": "midcap", "title": "Mid Cap Stars", "emoji": "⭐", "desc": "Quality mid caps with strong earnings trajectory.", "sort_order": 2,
+         "stocks": [
+            {"sym":"DMART","pe":50,"dr":15,"fy":15,"ec":18},{"sym":"SUNPHARMA","pe":30,"dr":15,"fy":10,"ec":14},
+            {"sym":"HCLTECH","pe":20,"dr":15,"fy":10,"ec":12},{"sym":"PIDILITIND","pe":55,"dr":13,"fy":10,"ec":14},
+            {"sym":"HAVELLS","pe":45,"dr":13,"fy":10,"ec":15},{"sym":"VOLTAS","pe":40,"dr":13,"fy":10,"ec":16},
+            {"sym":"POLYCAB","pe":35,"dr":13,"fy":10,"ec":18},{"sym":"WHIRLPOOL","pe":30,"dr":13,"fy":10,"ec":14},
+            {"sym":"DIXON","pe":60,"dr":15,"fy":10,"ec":25},{"sym":"TRENT","pe":80,"dr":15,"fy":10,"ec":28}
+         ]},
+        {"screen_id": "smallcap", "title": "Small Cap Gems", "emoji": "💡", "desc": "High-growth small caps with aggressive assumptions.", "sort_order": 3,
+         "stocks": [
+            {"sym":"POLICYBZR","pe":80,"dr":15,"fy":10,"ec":30},{"sym":"NYKAA","pe":100,"dr":15,"fy":10,"ec":35},
+            {"sym":"ZOMATO","pe":80,"dr":15,"fy":10,"ec":30},{"sym":"PAYTM","pe":50,"dr":15,"fy":10,"ec":40},
+            {"sym":"IRCTC","pe":35,"dr":13,"fy":10,"ec":18},{"sym":"CDSL","pe":40,"dr":13,"fy":10,"ec":20},
+            {"sym":"ANGELONE","pe":20,"dr":15,"fy":10,"ec":22},{"sym":"MCX","pe":35,"dr":13,"fy":10,"ec":18}
+         ]},
+        {"screen_id": "pharma", "title": "Pharma Picks", "emoji": "💊", "desc": "Pharma & healthcare stocks with sector-specific PE assumptions.", "sort_order": 4,
+         "stocks": [
+            {"sym":"SUNPHARMA","pe":30,"dr":13,"fy":10,"ec":14},{"sym":"DRREDDY","pe":22,"dr":13,"fy":10,"ec":12},
+            {"sym":"CIPLA","pe":25,"dr":13,"fy":10,"ec":12},{"sym":"DIVISLAB","pe":35,"dr":13,"fy":10,"ec":16},
+            {"sym":"AUROPHARMA","pe":20,"dr":13,"fy":10,"ec":14},{"sym":"LUPIN","pe":22,"dr":13,"fy":10,"ec":12},
+            {"sym":"TORNTPHARM","pe":30,"dr":13,"fy":10,"ec":14},{"sym":"ALKEM","pe":25,"dr":13,"fy":10,"ec":13}
+         ]},
+        {"screen_id": "banking", "title": "Banking & Finance", "emoji": "🏦", "desc": "Banks & NBFCs with conservative discount rates.", "sort_order": 5,
+         "stocks": [
+            {"sym":"HDFCBANK","pe":15,"dr":13,"fy":10,"ec":14},{"sym":"ICICIBANK","pe":15,"dr":15,"fy":10,"ec":14},
+            {"sym":"SBIN","pe":15,"dr":15,"fy":10,"ec":12},{"sym":"AXISBANK","pe":12,"dr":15,"fy":10,"ec":14},
+            {"sym":"KOTAKBANK","pe":18,"dr":13,"fy":10,"ec":14},{"sym":"BAJFINANCE","pe":20,"dr":15,"fy":10,"ec":18},
+            {"sym":"BAJAJFINSV","pe":15,"dr":15,"fy":10,"ec":16},{"sym":"CHOLAFIN","pe":20,"dr":15,"fy":10,"ec":20}
+         ]},
+    ]
+    
+    seeded = 0
+    for sc in DEFAULT_SCREENS:
+        existing = CuratedScreen.query.filter_by(screen_id=sc["screen_id"]).first()
+        if not existing:
+            screen = CuratedScreen(
+                screen_id=sc["screen_id"],
+                title=sc["title"],
+                emoji=sc["emoji"],
+                description=sc["desc"],
+                stocks_json=json.dumps(sc["stocks"]),
+                sort_order=sc["sort_order"],
+            )
+            db.session.add(screen)
+            seeded += 1
+    
+    db.session.commit()
+    total = CuratedScreen.query.count()
+    return jsonify({"seeded": seeded, "total": total})
 
 
 # ═══════ PROP RESEARCH ROUTES ═══════
@@ -2723,8 +2891,57 @@ def solveGrowth(pat, mcap, rPct, n, pe):
 # Stock API routes
 @app.route("/api/search")
 def search_stocks():
+    """
+    INSTANT local search from stock_master table — NO external API calls.
+    Falls back to nsetools/yfinance only if stock_master is empty.
+    """
     q = request.args.get("q", "").strip()
     if not q or len(q) < 1: return jsonify([])
+    
+    # Try local DB first (instant, no rate limits)
+    try:
+        master_count = StockMaster.query.count()
+        if master_count > 50:
+            ql = q.upper()
+            # Exact match first, then starts-with, then contains
+            results = []
+            # Exact symbol match
+            exact = StockMaster.query.filter(StockMaster.symbol == ql).first()
+            if exact:
+                results.append({"sym": exact.symbol, "name": exact.name, "sec": exact.sector or exact.exchange})
+            # Symbol starts with
+            starts = StockMaster.query.filter(
+                StockMaster.symbol.ilike(f"{ql}%"),
+                StockMaster.symbol != ql
+            ).order_by(StockMaster.symbol).limit(8).all()
+            for s in starts:
+                if not any(r["sym"] == s.symbol for r in results):
+                    results.append({"sym": s.symbol, "name": s.name, "sec": s.sector or s.exchange})
+            # Name contains (case insensitive)
+            if len(results) < 12:
+                name_matches = StockMaster.query.filter(
+                    StockMaster.name.ilike(f"%{q}%"),
+                    ~StockMaster.symbol.ilike(f"{ql}%")
+                ).order_by(StockMaster.name).limit(10).all()
+                for s in name_matches:
+                    if not any(r["sym"] == s.symbol for r in results):
+                        results.append({"sym": s.symbol, "name": s.name, "sec": s.sector or s.exchange})
+            # Symbol contains (for partial matches like "BANK" matching "HDFCBANK")
+            if len(results) < 12:
+                sym_contains = StockMaster.query.filter(
+                    StockMaster.symbol.ilike(f"%{ql}%"),
+                    ~StockMaster.symbol.ilike(f"{ql}%"),
+                    StockMaster.symbol != ql
+                ).order_by(StockMaster.symbol).limit(5).all()
+                for s in sym_contains:
+                    if not any(r["sym"] == s.symbol for r in results):
+                        results.append({"sym": s.symbol, "name": s.name, "sec": s.sector or s.exchange})
+            
+            return jsonify(results[:15])
+    except Exception as e:
+        log.warning(f"[SEARCH] DB search failed: {e}")
+    
+    # Fallback: old search via cache + API
     ck = f"s:{q.lower()}"
     c = cached(ck, SEARCH_TTL)
     if c is not None: return jsonify(c)
@@ -2735,18 +2952,30 @@ def search_stocks():
 
 @app.route("/api/stocklist")
 def stock_list():
-    """Return ALL NSE stock symbols + names in one lightweight call. Cached 24h."""
-    ck = "stocklist:v1"
+    """Return ALL stock symbols + names from stock_master table. Cached 24h."""
+    ck = "stocklist:v2"
     c = cached(ck, 86400)
     if c is not None:
         return jsonify(c)
 
     stocks = []
+    # Source 1: stock_master table (preferred — pre-populated via admin CSV upload)
+    try:
+        all_stocks = StockMaster.query.order_by(StockMaster.symbol).all()
+        if len(all_stocks) > 50:
+            stocks = [{"sym": s.symbol, "name": s.name, "sec": s.sector or s.exchange} for s in all_stocks]
+            log.info(f"[STOCKLIST] stock_master: {len(stocks)} stocks")
+            set_cache(ck, stocks, 86400)
+            return jsonify(stocks)
+    except Exception as e:
+        log.debug(f"[STOCKLIST] stock_master failed: {e}")
+
+    # Source 2: nsetools fallback
     try:
         from nsetools import Nse
         nse = Nse()
-        all_stocks = nse.get_stock_codes()
-        for sym, name in all_stocks.items():
+        all_codes = nse.get_stock_codes()
+        for sym, name in all_codes.items():
             if sym == "SYMBOL" or not sym:
                 continue
             stocks.append({"sym": sym, "name": name, "sec": "NSE"})
@@ -2757,23 +2986,6 @@ def stock_list():
     except Exception as e:
         log.debug(f"[STOCKLIST] nsetools failed: {e}")
 
-    for idx in ["NIFTY%2050", "NIFTY%20NEXT%2050", "NIFTY%20MIDCAP%2050", "NIFTY%20BANK", "NIFTY%20IT", "NIFTY%20PHARMA"]:
-        try:
-            s = _get_nse_session()
-            if not s: break
-            r = s.get(f"https://www.nseindia.com/api/equity-stockIndices?index={idx}", timeout=8)
-            if r.status_code == 200:
-                data = r.json()
-                for item in (data.get("data") or []):
-                    sym = item.get("symbol", "")
-                    name = item.get("meta", {}).get("companyName", "") or sym
-                    if sym and not any(st["sym"] == sym for st in stocks):
-                        stocks.append({"sym": sym, "name": name, "sec": "NSE"})
-        except: continue
-
-    if stocks:
-        log.info(f"[STOCKLIST] Combined: {len(stocks)} stocks")
-        set_cache(ck, stocks, 86400)
     return jsonify(stocks)
 
 
