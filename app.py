@@ -50,6 +50,7 @@ app = Flask(__name__)
 ALLOWED_ORIGINS = [
     "https://diyinvesting.in",
     "https://www.diyinvesting.in",
+    "https://diyrough.onrender.com",
     "http://localhost:3000",
     "http://localhost:5000",
     "http://127.0.0.1:5500",   # VS Code Live Server
