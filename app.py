@@ -154,25 +154,30 @@ log = logging.getLogger("diy")
 # ═══════ EMAIL HELPERS ═══════
 
 def send_email(to_email, subject, html_body):
-    """Send email via SMTP. Fails silently if SMTP not configured."""
+    """Send email via SMTP in background thread. Never blocks the request."""
     if not SMTP_USER or not SMTP_PASS:
         log.warning("[EMAIL] SMTP not configured — skipping email")
         return False
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = f"{FROM_NAME} <{SMTP_USER}>"
-        msg["To"] = to_email
-        msg.attach(MIMEText(html_body, "html"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, to_email, msg.as_string())
-        log.info(f"[EMAIL] Sent to {to_email}: {subject}")
-        return True
-    except Exception as e:
-        log.error(f"[EMAIL ERROR] {to_email}: {e}")
-        return False
+    
+    import threading
+    def _send():
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = f"{FROM_NAME} <{SMTP_USER}>"
+            msg["To"] = to_email
+            msg.attach(MIMEText(html_body, "html"))
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(SMTP_USER, to_email, msg.as_string())
+            log.info(f"[EMAIL] Sent to {to_email}: {subject}")
+        except Exception as e:
+            log.error(f"[EMAIL ERROR] {to_email}: {e}")
+    
+    t = threading.Thread(target=_send, daemon=True)
+    t.start()
+    return True  # Return immediately — email sends in background
 
 
 def welcome_email(user):
@@ -191,9 +196,9 @@ def welcome_email(user):
             <ul style="color:#334155;font-size:13px;line-height:2">
                 <li>🔄 <b>Reverse DCF</b> — Find implied growth for any Indian stock</li>
                 <li>📊 <b>Curated Screens</b> — Bluechip, Midcap, Smallcap screens</li>
-                <li>🤖 <b>AI Sentiment</b> — Real-time sentiment analysis</li>
                 <li>💼 <b>Portfolio Tracker</b> — Import holdings & track DCF</li>
                 <li>📋 <b>Watchlist</b> — Save & monitor your picks</li>
+                <li>📝 <b>Proprietary Research</b> — Deep-dive stock analyses</li>
             </ul>
             <div style="text-align:center;margin:24px 0">
                 <a href="{FRONTEND_URL}" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Start Analyzing Stocks →</a>
@@ -230,7 +235,7 @@ def subscription_email(user, plan, amount):
                 </table>
             </div>
             <p style="font-size:13px;color:#334155;line-height:1.6">
-                All Pro features are now unlocked. Enjoy curated screens, AI sentiment analysis, unlimited watchlist, portfolio tracking, and proprietary research.
+                All Pro features are now unlocked. Enjoy curated screens, unlimited watchlist, portfolio tracking with reverse DCF, and proprietary research.
             </p>
             <div style="text-align:center;margin:24px 0">
                 <a href="{FRONTEND_URL}" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Go to Dashboard →</a>
@@ -1401,31 +1406,65 @@ def upload_portfolio_csv():
         import io
         
         if file_ext in ["xlsx", "xls"]:
-            # Parse Excel file
+            # Parse Excel file — handles complex formats like Zerodha
             try:
                 import openpyxl
                 from io import BytesIO
                 
-                # Read Excel
-                wb = openpyxl.load_workbook(BytesIO(file.stream.read()), read_only=True)
-                ws = wb.active
+                # Read Excel (read_only=False to handle complex formats)
+                wb = openpyxl.load_workbook(BytesIO(file.stream.read()), read_only=False)
                 
-                # Convert to CSV-like structure
-                rows = list(ws.iter_rows(values_only=True))
-                if not rows:
-                    return jsonify({"error": "Excel file is empty"}), 400
+                # Try sheets in order: 'Equity', active, first sheet
+                ws = None
+                for name in ['Equity', 'Holdings', 'Portfolio']:
+                    if name in wb.sheetnames:
+                        ws = wb[name]; break
+                if ws is None:
+                    ws = wb.active
                 
-                # First row is headers
-                headers_raw = rows[0]
-                data_rows = rows[1:]
+                # SMART HEADER DETECTION: Scan rows to find the header row
+                # Zerodha puts headers at row 23, Groww at row 1, etc.
+                header_row_idx = None
+                all_rows = []
+                for row in ws.iter_rows(values_only=True):
+                    all_rows.append(row)
                 
-                # Create DictReader-like structure (normalize keys to lowercase)
-                csv_reader = [{(str(k).strip().lower() if k else ""): (str(v).strip() if v else "") for k, v in zip(headers_raw, row)} for row in data_rows]
+                # Look for a row containing "Symbol" or "Instrument" (case-insensitive)
+                for idx, row in enumerate(all_rows):
+                    row_strs = [str(v).strip().lower() if v else "" for v in row]
+                    if any(kw in s for s in row_strs for kw in ["symbol", "instrument", "scrip", "stock symbol", "trading symbol"]):
+                        header_row_idx = idx
+                        break
+                
+                if header_row_idx is None:
+                    return jsonify({"error": "Could not find a header row with 'Symbol' column. Please check your file format."}), 400
+                
+                headers_raw = all_rows[header_row_idx]
+                data_rows = all_rows[header_row_idx + 1:]
+                
+                # Filter out None headers, build DictReader-like structure
+                clean_headers = [(str(h).strip().lower() if h else "") for h in headers_raw]
+                csv_reader = []
+                for row in data_rows:
+                    if not row or all(v is None for v in row):
+                        continue
+                    d = {}
+                    for i, h in enumerate(clean_headers):
+                        if h and i < len(row):
+                            val = row[i]
+                            d[h] = str(val).strip() if val is not None else ""
+                    # Skip if symbol is empty
+                    sym_val = d.get("symbol", d.get("instrument", ""))
+                    if sym_val and sym_val.lower() not in ["", "none", "total", "symbol"]:
+                        csv_reader.append(d)
+                
                 fieldnames = headers_raw
+                log.info(f"[CSV UPLOAD] Excel parsed: header at row {header_row_idx+1}, {len(csv_reader)} data rows, headers: {clean_headers[:8]}")
                 
             except ImportError:
                 return jsonify({"error": "Excel support not installed. Please use CSV or contact support."}), 400
             except Exception as e:
+                log.error(f"[CSV UPLOAD] Excel parse error: {e}")
                 return jsonify({"error": f"Failed to parse Excel: {str(e)}"}), 400
         else:
             # Parse CSV file
@@ -1442,33 +1481,38 @@ def upload_portfolio_csv():
             headers = [h.strip().lower() for h in fieldnames] if fieldnames else []
         
         if not headers:
-            return jsonify({"error": "CSV file is empty or has no headers"}), 400
+            return jsonify({"error": "File is empty or has no headers"}), 400
         
-        # Column mapping patterns (flexible matching)
+        # Column mapping patterns (flexible matching for ALL broker formats)
         def find_column(patterns, headers):
             for pattern in patterns:
                 for h in headers:
-                    if re.search(pattern, h, re.IGNORECASE):
+                    if h and re.search(pattern, h, re.IGNORECASE):
                         return h
             return None
         
         symbol_col = find_column([
-            r'^symbol', r'^stock.*symbol', r'^trading.*symbol', r'^scrip', 
-            r'^isin', r'^instrument'
+            r'^symbol', r'^stock.*symbol', r'^trading.*symbol', r'^scrip',
+            r'^instrument', r'^ticker'
         ], headers)
         
         qty_col = find_column([
-            r'^qty', r'^quantity', r'^shares', r'^holding.*qty', r'^net.*qty'
+            r'^qty', r'^quantity', r'^shares', r'^holding.*qty', r'^net.*qty',
+            r'^quantity\s*available'
         ], headers)
         
         avg_price_col = find_column([
             r'^avg.*price', r'^average.*price', r'^buy.*price', r'^purchase.*price',
-            r'^price', r'^rate'
+            r'^price', r'^rate', r'^cost.*price'
         ], headers)
         
         # Optional columns
         name_col = find_column([
             r'^name', r'^company', r'^stock.*name', r'^scrip.*name'
+        ], headers)
+        
+        sector_col = find_column([
+            r'^sector', r'^industry'
         ], headers)
         
         date_col = find_column([
@@ -1566,18 +1610,12 @@ def upload_portfolio_csv():
                     existing.updated_at = datetime.utcnow()
                     log.info(f"[CSV] Updated {symbol}: qty {total_qty}")
                 else:
-                    # Get stock name from yfinance (optional, don't fail if it doesn't work)
-                    stock_name = row.get(name_col, symbol) if name_col else symbol
-                    sector = ""
+                    # Get stock name and sector from file if available
+                    stock_name = (row.get(name_col, "") if name_col else "") or symbol
+                    sector = (row.get(sector_col, "") if sector_col else "")
                     
-                    # Try to fetch from yfinance (but don't block on rate limits)
-                    try:
-                        quote = yf_quote(symbol)
-                        if quote:
-                            stock_name = quote.get('name', stock_name)
-                            sector = quote.get('sector', '')
-                    except:
-                        pass  # Continue even if yfinance fails
+                    # DON'T call yfinance during bulk upload — it's too slow
+                    # Live data will be fetched when user views portfolio
                     
                     # Create new holding
                     holding = Portfolio(
@@ -2237,7 +2275,7 @@ def post_article_comment(article_id):
     try:
         comment = ArticleComment(
             article_id=article_id,
-            user_id=request.user.id,
+            user_id=g.user.id,
             parent_id=parent_id,
             text=text
         )
