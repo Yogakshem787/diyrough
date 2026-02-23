@@ -90,13 +90,25 @@ db = SQLAlchemy(app)
 def add_cors_headers(response):
     """Safety-net CORS headers — covers edge cases flask-cors misses."""
     origin = request.headers.get("Origin", "")
+    # Always set CORS headers for allowed origins
     if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"]      = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Headers"]     = "Content-Type, Authorization"
         response.headers["Access-Control-Allow-Methods"]     = "GET, POST, PUT, DELETE, OPTIONS"
         response.headers["Vary"]                             = "Origin"
-    # Fix Google Sign-In COOP error: allow popup to postMessage back
+    elif not response.headers.get("Access-Control-Allow-Origin"):
+        # If flask-cors didn't set it and origin isn't in our list,
+        # still check if it's a subdomain match (e.g. www variant)
+        for allowed in ALLOWED_ORIGINS:
+            if origin and allowed.replace("https://www.", "https://") == origin.replace("https://www.", "https://"):
+                response.headers["Access-Control-Allow-Origin"]      = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Access-Control-Allow-Headers"]     = "Content-Type, Authorization"
+                response.headers["Access-Control-Allow-Methods"]     = "GET, POST, PUT, DELETE, OPTIONS"
+                response.headers["Vary"]                             = "Origin"
+                break
+    # Fix Google Sign-In COOP error
     response.headers["Cross-Origin-Opener-Policy"]    = "same-origin-allow-popups"
     response.headers["Cross-Origin-Embedder-Policy"]  = "unsafe-none"
     return response
@@ -126,6 +138,32 @@ def csrf_origin_check():
             if "/api/payment/webhook" not in request.path:
                 log.warning(f"[CSRF] Blocked request from origin: {origin} to {request.path}")
                 return jsonify({"error": "Origin not allowed"}), 403
+
+
+@app.errorhandler(500)
+def handle_500(e):
+    """Return CORS headers even on unhandled server errors."""
+    origin = request.headers.get("Origin", "")
+    resp = jsonify({"error": "Internal server error"})
+    resp.status_code = 500
+    if origin in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    log.error(f"[500] {request.path}: {e}")
+    return resp
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Catch-all: return CORS headers even on unhandled exceptions."""
+    origin = request.headers.get("Origin", "")
+    resp = jsonify({"error": "Server error"})
+    resp.status_code = 500
+    if origin in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    log.error(f"[UNHANDLED] {request.path}: {e}")
+    return resp
 
 PORT = int(os.environ.get("PORT", 10000))
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
