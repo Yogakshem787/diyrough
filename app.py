@@ -108,8 +108,8 @@ def add_cors_headers(response):
                 response.headers["Access-Control-Allow-Methods"]     = "GET, POST, PUT, DELETE, OPTIONS"
                 response.headers["Vary"]                             = "Origin"
                 break
-    # Fix Google Sign-In COOP error
-    response.headers["Cross-Origin-Opener-Policy"]    = "same-origin-allow-popups"
+    # Allow Google Sign-In popup to communicate back
+    response.headers["Cross-Origin-Opener-Policy"]    = "unsafe-none"
     response.headers["Cross-Origin-Embedder-Policy"]  = "unsafe-none"
     return response
 
