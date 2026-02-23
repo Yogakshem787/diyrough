@@ -214,17 +214,17 @@ def welcome_email(user):
 
 def subscription_email(user, plan, amount):
     """Send payment confirmation email."""
-    plan_labels = {"monthly": "Monthly", "quarterly": "Quarterly (3 months)", "yearly": "Annual"}
+    plan_labels = {"monthly": "Single Idea", "quarterly": "Quarterly Access", "yearly": "Annual Access"}
     plan_label = plan_labels.get(plan, plan.title())
     expires_str = user.plan_expires.strftime("%d %B %Y") if user.plan_expires else "N/A"
     send_email(
         user.email,
-        f"Payment Confirmed — {plan_label} Plan ✅",
+        f"Payment Confirmed — {plan_label} ✅",
         f"""
         <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px">
             <div style="background:linear-gradient(135deg,#059669,#047857);border-radius:12px;padding:28px;text-align:center;margin-bottom:20px">
                 <div style="font-size:40px;margin-bottom:8px">✅</div>
-                <h1 style="color:#fff;font-size:22px;margin:0 0 4px">Payment Successful!</h1>
+                <h1 style="color:#fff;font-size:22px;margin:0 0 4px">You're In!</h1>
                 <p style="color:#d1fae5;font-size:13px;margin:0">Thank you, {user.name or 'Investor'}!</p>
             </div>
             <div style="background:#f8fafc;border-radius:10px;padding:20px;margin-bottom:16px">
@@ -235,13 +235,14 @@ def subscription_email(user, plan, amount):
                 </table>
             </div>
             <p style="font-size:13px;color:#334155;line-height:1.6">
-                All Pro features are now unlocked. Enjoy curated screens, unlimited watchlist, portfolio tracking with reverse DCF, and proprietary research.
+                Full research access is now unlocked. You'll get complete analysis on our investment ideas — the same ones we're putting our own money into. This includes full thesis, catalysts, risks, and DCF valuations.
             </p>
             <div style="text-align:center;margin:24px 0">
-                <a href="{FRONTEND_URL}" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Go to Dashboard →</a>
+                <a href="{FRONTEND_URL}#research" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Read Research →</a>
             </div>
             <p style="color:#94a3b8;font-size:11px;text-align:center;margin-top:24px;border-top:1px solid #e5e7eb;padding-top:16px">
                 DIY Investing · Secure payments via Razorpay<br/>
+                For educational & research purposes only · Not a buy/sell recommendation<br/>
                 Questions? Reply to this email.
             </p>
         </div>
