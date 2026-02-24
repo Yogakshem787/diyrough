@@ -228,15 +228,14 @@ def welcome_email(user):
             <div style="background:linear-gradient(135deg,#0c1220,#1e293b);border-radius:12px;padding:28px;text-align:center;margin-bottom:20px">
                 <div style="background:linear-gradient(135deg,#f59e0b,#ea580c);display:inline-block;width:48px;height:48px;border-radius:12px;line-height:48px;font-weight:900;color:#0c1220;font-size:16px;margin-bottom:12px">DI</div>
                 <h1 style="color:#f1f5f9;font-size:22px;margin:0 0 4px">Welcome, {user.name or 'Investor'}!</h1>
-                <p style="color:#94a3b8;font-size:13px;margin:0">Your 2-day free trial is now active</p>
+                <p style="color:#94a3b8;font-size:13px;margin:0">Your account is ready</p>
             </div>
-            <h2 style="font-size:16px;color:#0f172a;margin-bottom:12px">Here's what you can do:</h2>
+            <h2 style="font-size:16px;color:#0f172a;margin-bottom:12px">Here's what you can explore:</h2>
             <ul style="color:#334155;font-size:13px;line-height:2">
                 <li>🔄 <b>Reverse DCF</b> — Find implied growth for any Indian stock</li>
-                <li>📊 <b>Curated Screens</b> — Bluechip, Midcap, Smallcap screens</li>
-                <li>💼 <b>Portfolio Tracker</b> — Import holdings & track DCF</li>
-                <li>📋 <b>Watchlist</b> — Save & monitor your picks</li>
-                <li>📝 <b>Proprietary Research</b> — Deep-dive stock analyses</li>
+                <li>💼 <b>Portfolio Tracker</b> — Import holdings & analyze with DCF</li>
+                <li>📋 <b>Watchlist</b> — Save & monitor stocks you're researching</li>
+                <li>📝 <b>Research & Learning</b> — Read detailed investment research (Pro)</li>
             </ul>
             <div style="text-align:center;margin:24px 0">
                 <a href="{FRONTEND_URL}" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Start Analyzing Stocks →</a>
@@ -273,7 +272,7 @@ def subscription_email(user, plan, amount):
                 </table>
             </div>
             <p style="font-size:13px;color:#334155;line-height:1.6">
-                Full research access is now unlocked. You'll get complete analysis on our investment ideas — the same ones we're putting our own money into. This includes full thesis, catalysts, risks, and DCF valuations.
+                Full research access is now unlocked. You'll receive our detailed educational reports covering investment thesis, catalysts, risk analysis, and DCF valuations — written by our community of experienced fund professionals.
             </p>
             <div style="text-align:center;margin:24px 0">
                 <a href="{FRONTEND_URL}#research" style="display:inline-block;background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;font-weight:700;padding:12px 32px;border-radius:8px;text-decoration:none;font-size:14px">Read Research →</a>
@@ -770,8 +769,8 @@ def signup():
         name=name,
         phone=phone,
         password_hash=hash_password(password),
-        plan="trial",
-        plan_expires=datetime.utcnow() + timedelta(days=2),
+        plan="free",
+        plan_expires=None,
         is_admin=(email in ADMIN_EMAILS),
     )
     db.session.add(u)
@@ -888,8 +887,8 @@ def google_auth():
                 name=name,
                 google_id=google_id,
                 avatar_url=picture,
-                plan="trial",
-                plan_expires=datetime.utcnow() + timedelta(days=2),
+                plan="free",
+                plan_expires=None,
                 is_admin=(email in ADMIN_EMAILS),
             )
             db.session.add(u)
@@ -1094,6 +1093,19 @@ def payment_webhook():
                       payment_notes.get("email") or
                       payment_customer.get("email") or
                       "").strip().lower()
+            # Extract phone number from Razorpay data
+            phone  = (notes.get("phone") or
+                      customer.get("contact") or
+                      payment.get("contact") or
+                      payment_notes.get("phone") or
+                      payment_customer.get("contact") or
+                      "").strip()
+            # Extract name
+            payer_name = (notes.get("name") or
+                          customer.get("name") or
+                          payment_notes.get("name") or
+                          payment_customer.get("name") or
+                          "").strip()
             plan   = (notes.get("plan") or 
                       payment_notes.get("plan") or
                       payment_link.get("description", "monthly").lower().split()[0] or
@@ -1101,10 +1113,11 @@ def payment_webhook():
             amount = payment.get("amount", 0) / 100  # paise to rupees
             pay_id = payment.get("id", "")
 
-            log.info(f"[WEBHOOK] Payment: email={email}, plan={plan}, amount=₹{amount}, id={pay_id}")
+            log.info(f"[WEBHOOK] Payment: email={email}, phone={phone}, name={payer_name}, plan={plan}, amount=₹{amount}, id={pay_id}")
             # Log full payload for debugging payment issues
             log.info(f"[WEBHOOK] Notes: {json.dumps(notes)[:200]}")
             log.info(f"[WEBHOOK] Customer: {json.dumps(customer)[:200]}")
+            log.info(f"[WEBHOOK] Payment Customer: {json.dumps(payment_customer)[:200]}")
 
             if not email:
                 log.error("[WEBHOOK] No email in payment - cannot update user")
@@ -1129,6 +1142,12 @@ def payment_webhook():
             user.plan = plan
             user.razorpay_payment_id = pay_id
             user.total_paid = (user.total_paid or 0) + amount
+            
+            # Update phone/name if we got them from payment and user doesn't have them
+            if phone and not user.phone:
+                user.phone = phone
+            if payer_name and not user.name:
+                user.name = payer_name
 
             # Record in payments table (prevent duplicate recording)
             existing_payment = Payment.query.filter_by(razorpay_payment_id=pay_id).first()
@@ -2178,14 +2197,36 @@ def admin_seed_default_screens():
 
 @app.route("/api/prop-research")
 def get_prop_research():
-    """Get all published prop research"""
+    """Get all published prop research. Full content stripped for non-pro users."""
     research = PropResearch.query.filter_by(is_active=True).order_by(PropResearch.published_at.desc()).all()
-    return jsonify([r.to_dict() for r in research])
+    
+    # Check if user is pro/admin
+    is_pro = False
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        try:
+            data = pyjwt.decode(auth[7:], app.config["SECRET_KEY"], algorithms=["HS256"])
+            user = User.query.get(data.get("uid"))
+            if user and (user.is_pro() or user.is_admin):
+                is_pro = True
+        except:
+            pass
+    
+    results = []
+    for r in research:
+        d = r.to_dict()
+        if not is_pro:
+            d["content"] = ""
+            d["catalysts"] = ""
+            d["risks"] = ""
+        results.append(d)
+    
+    return jsonify(results)
 
 
 @app.route("/api/prop-research/<int:research_id>")
 def get_research_detail(research_id):
-    """Get detailed research by ID and increment views"""
+    """Get detailed research by ID. Full content only for Pro users."""
     research = PropResearch.query.get(research_id)
     if not research or not research.is_active:
         return jsonify({"error": "Not found"}), 404
@@ -2193,7 +2234,28 @@ def get_research_detail(research_id):
     research.views = (research.views or 0) + 1
     db.session.commit()
     
-    return jsonify(research.to_dict())
+    # Check if user is pro/admin — if not, strip full content
+    result = research.to_dict()
+    
+    # Try to get user from token
+    is_pro = False
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        try:
+            data = pyjwt.decode(auth[7:], app.config["SECRET_KEY"], algorithms=["HS256"])
+            user = User.query.get(data.get("uid"))
+            if user and (user.is_pro() or user.is_admin):
+                is_pro = True
+        except:
+            pass
+    
+    if not is_pro:
+        # Non-pro users only get thesis teaser, not full content
+        result["content"] = ""
+        result["catalysts"] = ""
+        result["risks"] = ""
+    
+    return jsonify(result)
 
 
 @app.route("/api/prop-research", methods=["POST"])
